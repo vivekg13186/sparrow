@@ -85,6 +85,16 @@ pointers:
 - **AI Assist**: configure once via **Tools → AI Settings…** (OpenAI or
   Anthropic key). Then select text and hit `Cmd/Ctrl + Shift + A`.
 
+
+## Tech Stack
+
+- Tauri
+- Vue 3
+- Monaco Editor
+- xterm.js
+- Tabulator
+- Rust backend
+
 ## Note
 
 This is a personal experimental project focused on fast iteration and developer productivity.
