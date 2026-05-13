@@ -1158,7 +1158,14 @@ async function updatePreviewNow() {
     return;
   }
   try {
-    previewHtml.value = renderMarkdown(tab.model.getValue());
+    // Pass the tab's filePath as basePath so relative image references
+    // (e.g. `./diagram.png`) resolve against the source file's directory
+    // and get rewritten through Tauri's asset protocol. Unsaved buffers
+    // have no filePath; remote images still load fine without one.
+    previewHtml.value = renderMarkdown(
+      tab.model.getValue(),
+      tab.filePath || null
+    );
   } catch (err) {
     console.warn("[preview] markdown render failed:", err);
     previewHtml.value =

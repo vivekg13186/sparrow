@@ -27,6 +27,7 @@ import hljs from "highlight.js/lib/common";
 import "highlight.js/styles/github-dark.css";
 import taskLists from "markdown-it-task-lists";
 import mermaid from "mermaid";
+import { convertFileSrc } from "@tauri-apps/api/core";
 
 const md = new MarkdownIt({
   html: false,
@@ -90,13 +91,95 @@ const md = new MarkdownIt({
 // browser still applies the right accessibility semantics.
 md.use(taskLists, { enabled: false, label: true });
 
+// ---------------------------------------------------------------------------
+// Image source resolution
+// ---------------------------------------------------------------------------
+//
+// Markdown commonly references images by a path relative to the source file,
+// e.g. `![chart](images/q4.png)` or `![icon](./logo.svg)`. The WebView running
+// our preview can't load arbitrary filesystem paths directly — Tauri exposes
+// local files through its `asset:` protocol, and `convertFileSrc()` produces
+// the right URL for the current platform. So for any non-remote src:
+//
+//   1. Resolve it against the source file's directory (when we know it).
+//   2. Route it through `convertFileSrc` so the WebView can fetch it.
+//
+// Remote and inline sources (http(s), data:, blob:, asset:, file:) pass
+// through untouched — the CSP allows them, no rewriting needed.
+
+function isRemoteOrDataUrl(src) {
+  return /^(https?:|data:|blob:|asset:|file:|ftp:)/i.test(src);
+}
+
+function resolveImageSrc(src, basePath) {
+  if (!src) return src;
+  if (isRemoteOrDataUrl(src)) return src;
+  // Without a base path we can't resolve a relative reference. Hand the
+  // src back as-is and let the browser do whatever it can with it.
+  if (!basePath) return src;
+
+  let absPath;
+  // Absolute POSIX path or Windows drive-letter path → already absolute.
+  if (src.startsWith("/") || /^[A-Za-z]:[\\/]/.test(src)) {
+    absPath = src;
+  } else {
+    // Strip the filename off basePath to get the containing directory,
+    // then join with the relative src using whichever separator the
+    // basePath itself uses (keeps paths consistent on Windows).
+    const sepIdx = Math.max(
+      basePath.lastIndexOf("/"),
+      basePath.lastIndexOf("\\")
+    );
+    const baseDir = sepIdx >= 0 ? basePath.slice(0, sepIdx) : basePath;
+    const sep = basePath.includes("\\") ? "\\" : "/";
+    // Normalise a leading "./" — convertFileSrc handles it on most
+    // platforms but stripping it keeps the resulting URL tidy.
+    const cleanSrc = src.replace(/^\.[\\/]/, "");
+    absPath = baseDir + sep + cleanSrc;
+  }
+
+  try {
+    return convertFileSrc(absPath);
+  } catch (_) {
+    return src;
+  }
+}
+
+// markdown-it default image renderer falls back to `self.renderToken` when no
+// rule is registered. We grab that fallback once and call it after we've
+// rewritten the src attribute in place — keeps every other behaviour
+// (alt text, title, surrounding paragraph handling) identical to the
+// default.
+const defaultImageRender =
+  md.renderer.rules.image ||
+  function (tokens, idx, options, env, self) {
+    return self.renderToken(tokens, idx, options);
+  };
+
+md.renderer.rules.image = function (tokens, idx, options, env, self) {
+  const token = tokens[idx];
+  const srcIndex = token.attrIndex("src");
+  if (srcIndex >= 0) {
+    const src = token.attrs[srcIndex][1];
+    const resolved = resolveImageSrc(src, env && env.basePath);
+    if (resolved && resolved !== src) {
+      token.attrs[srcIndex][1] = resolved;
+    }
+  }
+  return defaultImageRender(tokens, idx, options, env, self);
+};
+
 /**
- * Render a markdown string to HTML. Empty / null input returns an empty
- * string so the preview pane goes blank cleanly.
+ * Render a markdown string to HTML.
+ *
+ * @param {string} text     Markdown source. Empty / null returns "".
+ * @param {string} [basePath]  Absolute path of the source file. Used to
+ *                             resolve relative image references; pass the
+ *                             current tab's filePath when available.
  */
-export function renderMarkdown(text) {
+export function renderMarkdown(text, basePath) {
   if (!text) return "";
-  return md.render(text);
+  return md.render(text, { basePath: basePath || null });
 }
 
 // ---------------------------------------------------------------------------

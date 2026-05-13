@@ -1,6 +1,6 @@
 # Sparrow
  
-![Sparrow](/src-tauri/icons/128x128.png)
+![Sparrow](src-tauri/icons/128x128.png)
 
 A lightweight notepad built on Tauri + Vue + Monaco.
 
@@ -21,6 +21,9 @@ A lightweight notepad built on Tauri + Vue + Monaco.
 
 ### MD view
 ![Sparrow](screenshot/md_view.png)
+
+### Whiteboard
+![Sparrow](screenshot/whiteboard.png)
 
 ### Snippet
 ![Sparrow](screenshot/snippet1.png)
