@@ -57,7 +57,7 @@ A lightweight notepad built on Tauri + Vue + Monaco.
 ## Keyboard shortcuts
 
 Full table — files, tab navigation, editing, tools, dialogs — lives in
-[`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md). Highlights:
+[`wiki/KEYBINDINGS.md`](wiki/KEYBINDINGS.md). Highlights:
 
 - **New / Open / Save**: `Cmd/Ctrl + N` / `O` / `S`
 - **Next / Previous tab** (wraps): `Ctrl + Tab` / `Ctrl + Shift + Tab` · also `Cmd/Ctrl + Alt + →` / `←`
@@ -72,7 +72,7 @@ Full table — files, tab navigation, editing, tools, dialogs — lives in
 
 Walkthroughs for the three features that aren't fully obvious from the
 toolbar — **Snippets**, **Quick Actions** (saved shell / Python tasks),
-and **AI Assist** — live in [`docs/USAGE.md`](docs/USAGE.md). Quick
+and **AI Assist** — live in [`wiki/USAGE.md`](wiki/USAGE.md). Quick
 pointers:
 
 - **Snippets**: bookmark+ icon saves the current selection; bookmark icon
