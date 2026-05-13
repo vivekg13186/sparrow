@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Minimum entitlements for a Tauri app under macOS hardened runtime.
+        Hardened runtime is *required* for notarization, and it blocks
+        executable-memory operations that the WebView (and Monaco's wasm
+        tokenizers) rely on. The two entitlements below punch the smallest
+        possible hole for that to work.
+
+        Add more entries here when wiring up features that need them:
+          - Camera:     com.apple.security.device.camera
+          - Microphone: com.apple.security.device.audio-input
+          - Network client (sandboxed builds only):
+                        com.apple.security.network.client
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
