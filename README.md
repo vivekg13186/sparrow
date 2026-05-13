@@ -4,6 +4,9 @@
 
 A lightweight notepad built on Tauri + Vue + Monaco.
 
+![Sparrow](/screenshot.png)
+
+
 ## Features
 
 **Editing**
