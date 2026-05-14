@@ -1,10 +1,42 @@
 # How to use
 
-Walkthroughs for the three features that have multiple modes / template
+Walkthroughs for the features that have multiple modes / template
 variables / setup steps and aren't fully obvious from the toolbar alone:
-**Snippets**, **Quick Actions** (tasks), and **AI Assist**. Everything
-else — editor, file explorer, terminal, markdown preview — works the way
-you'd expect from VS Code or a regular IDE.
+the **Command Palette**, **Snippets**, **Quick Actions** (tasks), and
+**AI Assist**. Everything else — editor, file explorer, terminal,
+markdown preview — works the way you'd expect from VS Code or a regular
+IDE.
+
+## Command Palette
+
+Press `Cmd/Ctrl + Shift + P` from anywhere to open a VS Code–style
+launcher. It's the fastest way to run something without hunting through
+menus or remembering a shortcut.
+
+The palette covers:
+
+- **File** — New, Open, Save, Save As, Close tab, Quit.
+- **Edit** — Find, Replace, Go to line, Select all, Format document,
+  Format selection.
+- **View** — Toggle theme, toggle markdown preview, toggle split view.
+- **Tabs** — Next / Previous, Show all tabs.
+- **Tools** — New terminal, File Explorer, AI Assist, AI Settings,
+  Quick Actions, Snippets, Save selection as snippet, Check for updates.
+- **Language** — One row per Monaco language; selecting it re-tags the
+  active editor tab's syntax (the file extension is left untouched).
+- **Run Action** — One row per saved Quick Action. Selecting a row
+  runs it just like clicking it in the Zap dialog.
+- **Snippet** / **Prompt** — One row per saved snippet. Text snippets
+  paste at the cursor; prompt snippets send the selection to the AI
+  and replace it with the response.
+
+The search box does a whitespace-tokenized substring match against the
+group + label, so `snip py` finds an `Insert snippet: python-shebang`
+row and `set md` finds `Set language: Markdown`. Arrow keys move the
+highlight, `Enter` runs it, `Esc` closes.
+
+The palette rebuilds its list each time you open it, so brand-new
+snippets and actions appear immediately — no app restart needed.
 
 ## Snippets
 

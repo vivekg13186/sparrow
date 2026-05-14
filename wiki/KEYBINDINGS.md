@@ -14,6 +14,20 @@ either.
 | Save As… | `Cmd/Ctrl + Shift + S` |
 | Quit | `Cmd/Ctrl + Q` |
 
+## Command Palette
+
+| Action | Shortcut |
+| --- | --- |
+| Open Command Palette | `Cmd/Ctrl + Shift + P` |
+| Move highlight | `↑` / `↓` |
+| Run highlighted command | `Enter` |
+| Close palette | `Esc` |
+
+The palette is a fuzzy launcher for everything the app can do — file ops,
+edit actions, view toggles, language change, saved snippets, saved quick
+actions. Start typing a command name or use whitespace-separated tokens
+(e.g. `snip py`, `set md`) to narrow the list.
+
 ## Tab navigation
 
 | Action | Shortcut |
