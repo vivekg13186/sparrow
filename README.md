@@ -39,12 +39,13 @@ A lightweight notepad built on Tauri + Vue + Monaco.
 - Multi-tab UI with a type-and-search tab dropdown
 - 2-column split view (compare two files side by side)
 - Find, replace, go-to-line
-- Spell check for `.md` and `.txt` (powered by CSpell)
+- Word wrap toggle (`Alt + Z`)
+- Spell check for `.md` and `.txt` (CSpell) with inline Quick Fix suggestions and a Problems panel
 
 **Files**
 
-- File explorer with extension-aware icons
-- Markdown live preview
+- File explorer with extension-aware icons (shows hidden files by default)
+- Markdown live preview — copy as HTML or export to PDF from the preview toolbar
 - CSV / XLSX table editor (Tabulator)
 - Image / SVG / PDF preview
 - Whiteboard (`.sbw`) — free-hand drawing, shapes, text; export PNG / SVG / PDF
@@ -53,6 +54,8 @@ A lightweight notepad built on Tauri + Vue + Monaco.
 
 - Built-in terminals (PTY-backed via xterm.js)
 - HTTP client for `.http` files (REST Client–compatible)
+- Git browser — status, stage, commit, pull, push (shells out to your system `git`)
+- Command Palette — VS Code-style fuzzy launcher (`Cmd/Ctrl + Shift + P`)
 - Snippets — text snippets and **prompt snippets** that run through AI
 - Quick Actions — saved shell commands or Python scripts with template variables (`{file}`, `{dir}`, `{selection}`, …)
 - AI assist over a text selection (OpenAI or Anthropic)
@@ -62,6 +65,7 @@ A lightweight notepad built on Tauri + Vue + Monaco.
 Full table — files, tab navigation, editing, tools, dialogs — lives in
 [`wiki/KEYBINDINGS.md`](wiki/KEYBINDINGS.md). Highlights:
 
+- **Command Palette** (run anything by name): `Cmd/Ctrl + Shift + P`
 - **New / Open / Save**: `Cmd/Ctrl + N` / `O` / `S`
 - **Next / Previous tab** (wraps): `Ctrl + Tab` / `Ctrl + Shift + Tab` · also `Cmd/Ctrl + Alt + →` / `←`
 - **Jump to tab N** (1 – 9): `Cmd/Ctrl + 1` … `Cmd/Ctrl + 9` — numbers are visible on the tabs themselves
@@ -73,11 +77,14 @@ Full table — files, tab navigation, editing, tools, dialogs — lives in
 
 ## How to use
 
-Walkthroughs for the three features that aren't fully obvious from the
-toolbar — **Snippets**, **Quick Actions** (saved shell / Python tasks),
-and **AI Assist** — live in [`wiki/USAGE.md`](wiki/USAGE.md). Quick
-pointers:
+Walkthroughs for the features that aren't fully obvious from the
+toolbar — the **Command Palette**, **Snippets**, **Quick Actions**
+(saved shell / Python tasks), and **AI Assist** — live in
+[`wiki/USAGE.md`](wiki/USAGE.md). Quick pointers:
 
+- **Command Palette**: hit `Cmd/Ctrl + Shift + P` and start typing — file
+  ops, edit actions, view toggles, language change, every saved snippet
+  and quick action, all in one list.
 - **Snippets**: bookmark+ icon saves the current selection; bookmark icon
   opens the library. Two flavors — **text** (pastes at cursor) and
   **prompt** (runs through AI on your selection).

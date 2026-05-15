@@ -19,6 +19,7 @@ import TerminalTab from "./TerminalTab.vue";
 import FileExplorerTab from "./FileExplorerTab.vue";
 import TableTab from "./TableTab.vue";
 import WhiteboardTab from "./WhiteboardTab.vue";
+import GitTab from "./GitTab.vue";
 import PreviewTab from "./PreviewTab.vue";
 import { registerHttpLanguage } from "../http-language.js";
 import { findRequestAtCursor } from "../http-parser.js";
@@ -75,6 +76,8 @@ import {
   X,
   ChevronDown,
   ChevronUp,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   Columns2,
   BookmarkPlus,
@@ -91,6 +94,13 @@ import {
   AlertTriangle,
   History,
   Download,
+  Command as CommandIcon,
+  Search,
+  WrapText,
+  ClipboardCopy,
+  FileText as FileTextIcon,
+  Printer,
+  GitBranch,
 } from "lucide-vue-next";
 
 // One-shot registration of the .http / .rest Monaco language.
@@ -171,6 +181,27 @@ const splitView = ref(false);
 const rightPanelTabId = ref(null);
 const editor2Container = ref(null);
 let editor2 = null;
+
+// Word-wrap state, shared across both editor panes. Monaco's wordWrap is
+// per-editor so we mirror this value when toggling. Persisted so a wrap
+// preference survives an app restart — saved on every flip below.
+const wordWrap = ref(
+  (typeof localStorage !== "undefined" && localStorage.getItem("sparrow.wordWrap") === "on") ||
+    false
+);
+
+// Problems panel toggle. The panel surfaces every spelling issue in the
+// active tab as a list with click-to-replace suggestions. Off by default
+// so the editor area stays as tall as possible; users opt in via the
+// status-bar badge or the palette.
+const problemsPanelOpen = ref(false);
+function toggleProblemsPanel() {
+  problemsPanelOpen.value = !problemsPanelOpen.value;
+  // Monaco's layout depends on container size — relayout next frame so
+  // it picks up the new available height.
+  if (editor) requestAnimationFrame(() => editor.layout());
+  if (editor2) requestAnimationFrame(() => editor2.layout());
+}
 // Per-tab view state for the right editor — kept separate from the left
 // editor's `tab.viewState` so each side remembers its own cursor/scroll.
 const editor2ViewStates = new Map();
@@ -417,6 +448,24 @@ function makeExplorerTab(folderPath) {
   };
 }
 
+// Git browser tab. `repoPath` is the working-tree root (where `.git`
+// lives); the title shows the leaf folder so a tab strip with several
+// projects open is still readable.
+function makeGitTab(repoPath) {
+  const id = nextTabId++;
+  const leaf =
+    repoPath
+      .split(/[\\/]/)
+      .filter(Boolean)
+      .pop() || repoPath;
+  return {
+    id,
+    kind: "git",
+    filename: `Git: ${leaf}`,
+    repoPath,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Active-tab plumbing
 // ---------------------------------------------------------------------------
@@ -474,6 +523,9 @@ const whiteboardTabsList = computed(() =>
 );
 const previewTabsList = computed(() =>
   tabs.value.filter((t) => t.kind === "preview")
+);
+const gitTabsList = computed(() =>
+  tabs.value.filter((t) => t.kind === "git")
 );
 
 function activateTab(tabId) {
@@ -567,6 +619,11 @@ function closeTab(tabId, event) {
     if (pending) {
       clearTimeout(pending);
       spellTimers.delete(tab.id);
+    }
+    // Drop cached spell-check issues so the Problems panel doesn't keep
+    // showing them after the tab is gone.
+    if (spellIssuesByTab.delete(tab.id)) {
+      spellIssuesVersion.value++;
     }
     // If the right pane was showing this tab, clear it so the disposed
     // model doesn't try to render.
@@ -959,6 +1016,28 @@ async function handleOpen() {
   }
 }
 
+// Open-by-path escape hatch. The native OS file picker hides dotfiles by
+// default (macOS needs Cmd+Shift+. inside the dialog to reveal them; on
+// Windows you have to flip a global Explorer setting), so `.env`,
+// `.gitignore`, `.npmrc`, etc. can be hard to open through the picker.
+// This prompt lets the user just type the absolute path. Tilde-expansion
+// is intentionally not implemented — Tauri's fs canonicalizes on its end.
+async function handleOpenByPath() {
+  const path = window.prompt(
+    "Open file by path:\n\n" +
+      "Tip: paste an absolute path. Useful for hidden files like .env, " +
+      ".gitignore that the OS file picker hides by default."
+  );
+  if (!path) return;
+  const trimmed = path.trim();
+  if (!trimmed) return;
+  try {
+    await openPathSmart(trimmed);
+  } catch (err) {
+    flashStatus(`Open failed: ${err}`);
+  }
+}
+
 function handleTerminal() {
   addTerminalTab();
 }
@@ -992,6 +1071,33 @@ async function handleFileExplorer() {
 // `openPathSmart` so CSV / XLSX also land in the table-tab kind.
 function openFileFromExplorer(filePath) {
   return openPathSmart(filePath);
+}
+
+// ---------------------------------------------------------------------------
+// Git Browser
+// ---------------------------------------------------------------------------
+//
+// Pick a repo root (the folder that contains `.git`) and open a Git tab
+// rooted at it. We don't validate the `.git` presence here — the tab's
+// initial `git status` call returns the appropriate error if the folder
+// isn't a repo, and the user can fix it without us having to second-guess.
+
+async function handleGitBrowser() {
+  try {
+    const chosen = await openDialog({
+      title: "Select a git repository",
+      directory: true,
+      multiple: false,
+    });
+    if (!chosen) return;
+    const path = Array.isArray(chosen) ? chosen[0] : chosen;
+    const tab = makeGitTab(path);
+    tabs.value = [...tabs.value, tab];
+    activateTab(tab.id);
+    flashStatus(`Opened git: ${tab.filename}`);
+  } catch (err) {
+    flashStatus(`Could not open git tab: ${err}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,20 +1210,46 @@ async function runSpellCheck(tab) {
   }
 }
 
+// Per-tab cache of the latest spell-check issues. Drives both the Problems
+// panel (which renders the whole list with their suggestions) and the
+// Monaco CodeActionProvider (which reads it on demand at a hover/cursor
+// position). Keyed by tab.id; entries cleared when the tab closes or its
+// language changes away from a spell-checkable one.
+const spellIssuesByTab = new Map();
+// shallowRef-ish counter so Vue knows when the cache changed. The Map
+// itself is mutated in place (cheaper than rebuilding it every keystroke).
+const spellIssuesVersion = ref(0);
+
 function applySpellMarkers(tab, issues) {
   const model = tab.model;
-  const markers = issues.map((i) => {
+  // Enrich each issue with its line/column up front. The Problems panel
+  // needs it for display; the CodeActionProvider needs it to match the
+  // user's cursor. Computing positions once here is cheaper than calling
+  // getPositionAt every render.
+  const enriched = issues.map((i) => {
     const start = model.getPositionAt(i.offset);
     const end = model.getPositionAt(i.offset + i.length);
+    return {
+      ...i,
+      startLineNumber: start.lineNumber,
+      startColumn: start.column,
+      endLineNumber: end.lineNumber,
+      endColumn: end.column,
+    };
+  });
+  spellIssuesByTab.set(tab.id, enriched);
+  spellIssuesVersion.value++;
+
+  const markers = enriched.map((i) => {
     const suggList =
       i.suggestions && i.suggestions.length
         ? "\nSuggestions: " + i.suggestions.join(", ")
         : "";
     return {
-      startLineNumber: start.lineNumber,
-      startColumn: start.column,
-      endLineNumber: end.lineNumber,
-      endColumn: end.column,
+      startLineNumber: i.startLineNumber,
+      startColumn: i.startColumn,
+      endLineNumber: i.endLineNumber,
+      endColumn: i.endColumn,
       message: `Possible misspelling: "${i.text}"${suggList}`,
       severity: monaco.MarkerSeverity.Info,
       source: "cspell",
@@ -1133,6 +1265,67 @@ function clearSpellMarkers(tab) {
   const model = tab.model;
   if (!model || (model.isDisposed && model.isDisposed())) return;
   monaco.editor.setModelMarkers(model, "cspell", []);
+  spellIssuesByTab.delete(tab.id);
+  spellIssuesVersion.value++;
+}
+
+// Issues for whichever tab is currently active, sorted top-to-bottom so
+// the Problems panel reads like a linear walk through the document. The
+// `spellIssuesVersion` dependency forces re-evaluation on every cache
+// update without us having to wrap the Map in a reactive proxy.
+const activeTabSpellIssues = computed(() => {
+  spellIssuesVersion.value; // dep
+  tabsVersion.value; // active tab can change too
+  const tab = activeTab.value;
+  if (!tab || tab.kind !== "editor") return [];
+  const list = spellIssuesByTab.get(tab.id) || [];
+  return [...list].sort(
+    (a, b) =>
+      a.startLineNumber - b.startLineNumber ||
+      a.startColumn - b.startColumn
+  );
+});
+
+// Jump the editor cursor to the start of an issue and reveal the line.
+// Used by the Problems panel — clicking a row navigates there.
+function jumpToSpellIssue(issue) {
+  if (!editor || !activeTab.value) return;
+  editor.focus();
+  editor.revealPositionInCenter({
+    lineNumber: issue.startLineNumber,
+    column: issue.startColumn,
+  });
+  editor.setPosition({
+    lineNumber: issue.startLineNumber,
+    column: issue.startColumn,
+  });
+}
+
+// Replace the misspelled word at `issue` with `replacement`. Routes through
+// Monaco's executeEdits so undo/redo, selection, and dirty tracking all
+// behave the same as a manual edit. Re-runs spell-check afterwards so
+// the panel updates immediately.
+function replaceSpellIssue(issue, replacement) {
+  const tab = activeTab.value;
+  if (!tab || tab.kind !== "editor" || !editor) return;
+  const model = tab.model;
+  if (!model || (model.isDisposed && model.isDisposed())) return;
+  const range = new monaco.Range(
+    issue.startLineNumber,
+    issue.startColumn,
+    issue.endLineNumber,
+    issue.endColumn
+  );
+  editor.executeEdits("spell-fix", [
+    {
+      range,
+      text: replacement,
+      forceMoveMarkers: true,
+    },
+  ]);
+  flashStatus(`Replaced "${issue.text}" → "${replacement}"`);
+  // Re-check soon so the now-corrected word disappears from the panel.
+  scheduleSpellCheck(tab);
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1390,7 @@ function initEditor2() {
     scrollBeyondLastLine: false,
     smoothScrolling: true,
     tabSize: 2,
+    wordWrap: wordWrap.value ? "on" : "off",
   });
   if (rightPanelTabId.value !== null) {
     applyRightPanelTab(rightPanelTabId.value);
@@ -1291,6 +1485,114 @@ function closeSplitView() {
   rightPanelTabId.value = null;
   disposeEditor2();
   if (editor) requestAnimationFrame(() => editor.layout());
+}
+
+// Copy the current markdown preview to clipboard as HTML. Sends both an
+// `text/html` and `text/plain` representation so paste targets that
+// don't understand HTML (terminals, code editors) still see something
+// useful. Uses the modern Clipboard API which Tauri's WebView supports.
+async function copyPreviewAsHtml() {
+  const html = previewHtml.value || "";
+  if (!html.trim()) {
+    flashStatus("Nothing to copy — preview is empty");
+    return;
+  }
+  try {
+    // ClipboardItem accepts a `{ mime: Blob }` map. The plain-text fallback
+    // strips tags via a throwaway DOM so the user gets the visible text.
+    const plain = document.createElement("div");
+    plain.innerHTML = html;
+    const item = new ClipboardItem({
+      "text/html": new Blob([html], { type: "text/html" }),
+      "text/plain": new Blob([plain.textContent || ""], { type: "text/plain" }),
+    });
+    await navigator.clipboard.write([item]);
+    flashStatus("Copied as HTML");
+  } catch (err) {
+    // Fall back to plain-text-only if ClipboardItem isn't permitted.
+    try {
+      await navigator.clipboard.writeText(html);
+      flashStatus("Copied HTML source (fallback)");
+    } catch (e2) {
+      console.warn("[md-preview] copy failed:", e2);
+      flashStatus(`Copy failed: ${e2}`);
+    }
+  }
+}
+
+// Export the preview pane to PDF by opening a print preview that contains
+// only the rendered HTML. The user picks "Save as PDF" in the system
+// print dialog. We open a child window with a self-contained document
+// (its own <style> block + the preview HTML) so the print is isolated
+// from the app's CSS — otherwise our dark toolbar and editor chrome
+// would bleed into the PDF.
+// Export the markdown preview as PDF using the WebView's own print
+// pipeline. Approach: mark the body with `printing-preview`, which our
+// stylesheet's `@media print` rules turn into "hide everything except
+// the preview area and re-style it for paper". Then call `window.print()`
+// — the system print dialog opens, the user picks "Save as PDF".
+//
+// Why not popup/iframe? Tauri WebViews (WKWebView on macOS, WebView2
+// on Windows, webkit2gtk on Linux) all block `window.open` popups by
+// default, and iframe-based printing trips on CSP `frame-src` rules
+// or fails silently in WebView2. Printing the main document with a
+// scoped @media print stylesheet sidesteps both: no popup permission,
+// no extra origin, no CSP fight.
+function exportPreviewAsPdf() {
+  if (!previewPaneEl.value) {
+    flashStatus("No preview to export");
+    return;
+  }
+  if (!previewHtml.value || !previewHtml.value.trim()) {
+    flashStatus("Nothing to export — preview is empty");
+    return;
+  }
+  // The class on <html> activates print-only rules. We use the root
+  // element rather than <body> so even body-positioned overlays (e.g.
+  // the command palette) get suppressed cleanly.
+  const root = document.documentElement;
+  root.classList.add("printing-preview");
+
+  // afterprint fires whether the user printed or cancelled. Clean up
+  // by removing the class so the screen view returns to normal.
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    root.classList.remove("printing-preview");
+    window.removeEventListener("afterprint", cleanup);
+  };
+  window.addEventListener("afterprint", cleanup);
+
+  // Defer print() one frame so the @media print rules have laid out
+  // before the dialog snapshots the document.
+  requestAnimationFrame(() => {
+    try {
+      window.print();
+    } catch (err) {
+      console.warn("[md-preview] print failed:", err);
+      flashStatus(`Print failed: ${err}`);
+      cleanup();
+    }
+    // Belt-and-braces cleanup in case afterprint doesn't fire.
+    setTimeout(cleanup, 60_000);
+  });
+}
+
+// Flip word-wrap on both editor panes. Monaco exposes wordWrap as a
+// runtime option via updateOptions, so no reload needed. We persist the
+// preference to localStorage so the choice survives across sessions.
+function toggleWordWrap() {
+  wordWrap.value = !wordWrap.value;
+  const wrap = wordWrap.value ? "on" : "off";
+  if (editor) editor.updateOptions({ wordWrap: wrap });
+  if (editor2) editor2.updateOptions({ wordWrap: wrap });
+  try {
+    localStorage.setItem("sparrow.wordWrap", wrap);
+  } catch (_) {
+    /* private mode or quota — silently ignore */
+  }
+  flashStatus(`Word wrap ${wrap}`);
 }
 
 function togglePreview() {
@@ -2322,6 +2624,24 @@ function interpolateCommand(template, ctx) {
     .replace(/\{selection\}/g, ctx.selection);
 }
 
+// macOS WKWebView (and similar) silently substitute "smart" punctuation in
+// regular <input>/<textarea> fields: `"` → `“`/`”`, `'` → `‘`/`’`, `--` →
+// `—`, etc. When a saved action contains those characters and we pipe it
+// into a shell, the shell sees curly quotes instead of straight ones and
+// `cd "..."` fails. The form fields below set autocorrect/spellcheck off
+// to discourage the substitution, but anything already saved before this
+// change still has the smart characters in it — so we also normalise at
+// execution time. Cheap, idempotent, safe on strings that contain neither.
+function normalizeShellText(s) {
+  if (!s) return s;
+  return s
+    .replace(/[“”„‟″‶]/g, '"')
+    .replace(/[‘’‚‛′‵]/g, "'")
+    .replace(/—/g, "--")
+    .replace(/–/g, "-")
+    .replace(/…/g, "...");
+}
+
 function openActionsDialog() {
   refreshActionsList();
   actionSearchQuery.value = "";
@@ -2388,7 +2708,9 @@ function runAction(action) {
   if (type === "python") {
     runPythonAction(action);
   } else {
-    const command = interpolateCommand(action.command, getActionContext());
+    const command = normalizeShellText(
+      interpolateCommand(action.command, getActionContext())
+    );
     const tab = makeTerminalTab({
       filename: action.name,
       initialCommand: command,
@@ -2423,7 +2745,9 @@ async function runPythonAction(action) {
   // Tokenize the args field on whitespace. Users who need shell-grade
   // quoting can move that complexity into the script itself; we keep this
   // tokenizer dumb on purpose.
-  const argsList = interpolateCommand(action.args || "", ctx)
+  const argsList = normalizeShellText(
+    interpolateCommand(action.args || "", ctx)
+  )
     .split(/\s+/)
     .filter(Boolean);
 
@@ -2502,11 +2826,21 @@ onMounted(async () => {
     scrollBeyondLastLine: false,
     smoothScrolling: true,
     tabSize: 2,
+    wordWrap: wordWrap.value ? "on" : "off",
   });
 
   // Populate the status-bar language list now that all custom languages
   // (e.g. our `.http` language) are registered.
   loadLanguageList();
+
+  // Wire spell-check quick fixes. Monaco's CodeActionProvider is the
+  // mechanism behind the lightbulb / Cmd+. ("Quick Fix") flow. We
+  // register one per spell-checkable language so that hovering or
+  // placing the cursor on a misspelled word offers each suggestion as
+  // a one-click replacement. The provider reads from `spellIssuesByTab`
+  // (populated by `applySpellMarkers`), so it stays consistent with the
+  // Problems panel without recomputing anything.
+  registerSpellCheckCodeActions();
 
   // Pre-loaded starter tabs are commented out — the app boots empty and
   // the user opens whatever they actually want via File → New / Open or
@@ -2538,7 +2872,14 @@ onMounted(async () => {
   document.addEventListener("keydown", handleTabNumericNavKey);
 
   // Arrow-key tab nav: Ctrl/Cmd + Alt + Left/Right and Ctrl + PageUp/Down.
-  document.addEventListener("keydown", handleTabArrowNavKey);
+  // Capture phase so Ctrl+Tab beats Monaco's own Tab handling (Monaco
+  // inserts whitespace on Tab when focus is in the editor area).
+  document.addEventListener("keydown", handleTabArrowNavKey, true);
+
+  // Command palette: Cmd/Ctrl+Shift+P + arrow/enter/esc while open. Capture
+  // phase so Monaco's built-in palette doesn't swallow the shortcut first
+  // when focus is in the editor.
+  document.addEventListener("keydown", handleCommandPaletteKey, true);
 
   // Window-close guard. Intercepts X button / Cmd+Q / File→Quit so dirty
   // tabs get a confirmation prompt before the window goes away.
@@ -2579,6 +2920,8 @@ onMounted(async () => {
           return handleTerminal();
         case "file_explorer":
           return handleFileExplorer();
+        case "git_browser":
+          return handleGitBrowser();
         case "ai_assist":
           return handleAiAssist();
         case "ai_settings":
@@ -2612,7 +2955,8 @@ onBeforeUnmount(() => {
   document.removeEventListener("click", handleDocumentClickForDropdown);
   document.removeEventListener("keydown", handleTabDropdownKey);
   document.removeEventListener("keydown", handleTabNumericNavKey);
-  document.removeEventListener("keydown", handleTabArrowNavKey);
+  document.removeEventListener("keydown", handleTabArrowNavKey, true);
+  document.removeEventListener("keydown", handleCommandPaletteKey, true);
   if (unlistenClose) unlistenClose();
   // Cancel any pending draft writes so they don't run after the component
   // is gone.
@@ -2670,6 +3014,7 @@ function closeActiveTab() {
 // keystrokes from a dialog the user is interacting with.
 function isModalChromeOpen() {
   if (tabDropdownOpen.value) return true;
+  if (cmdPaletteOpen.value) return true;
   if (typeof document === "undefined") return false;
   return !!document.querySelector(".modal-overlay");
 }
@@ -2729,6 +3074,22 @@ function handleTabArrowNavKey(event) {
       return;
     }
   }
+
+  // Ctrl+Tab / Ctrl+Shift+Tab. We handle these in JS because Tauri's
+  // muda menu accelerators don't reliably register the Tab key on every
+  // platform — the accelerator string parses fine, but the OS-level
+  // menu engine sometimes never fires the click event for Tab. Doing
+  // the work here makes the shortcut behave the same everywhere.
+  //
+  // Using `event.code === "Tab"` (the physical key) rather than
+  // `event.key === "Tab"` (the produced character) avoids issues with
+  // some Windows layouts that report `event.key` as "Tab" only when no
+  // modifier is pressed.
+  if (!event.altKey && event.code === "Tab") {
+    event.preventDefault();
+    cycleTab(event.shiftKey ? -1 : 1);
+    return;
+  }
 }
 
 // Returns "1".."9" for the corresponding tab's position in `tabs`, or ""
@@ -2748,6 +3109,7 @@ function iconFor(tab) {
   if (!tab) return FileText;
   if (tab.kind === "terminal") return Terminal;
   if (tab.kind === "explorer") return Folder;
+  if (tab.kind === "git") return GitBranch;
   if (tab.kind === "table") return FileSpreadsheet;
   if (tab.kind === "whiteboard") return PenTool;
   if (tab.kind === "preview") {
@@ -2791,6 +3153,92 @@ function loadLanguageList() {
   }
 }
 
+// CodeActionProvider for spelling quick fixes. Returns one CodeAction per
+// suggestion, each of which performs a WorkspaceEdit replacing the
+// misspelled word in place. We register the same provider for every
+// language we spell-check (currently markdown + plaintext).
+//
+// Why not provider-per-issue? Monaco invokes the provider with a range —
+// the current selection or word at cursor — and a list of relevant
+// markers. We look up our cached issue list by matching the marker's
+// span back to the cache, which avoids depending on Monaco's marker
+// representation (the marker `source` field IS "cspell" which is enough
+// to filter, but the suggestion list isn't carried on the marker).
+function registerSpellCheckCodeActions() {
+  // Walk our spell-check-eligible languages and bind one provider apiece.
+  for (const lang of SPELL_LANGUAGES) {
+    monaco.languages.registerCodeActionProvider(lang, {
+      provideCodeActions(model, range, context /*, token */) {
+        // Only act on our own markers. Other markers (Monaco's built-in
+        // JSON / TS validators on the same buffer) come through with a
+        // different `source`; we skip them so we don't offer nonsense
+        // fixes for unrelated diagnostics.
+        const cspellMarkers = (context.markers || []).filter(
+          (m) => m.source === "cspell"
+        );
+        if (cspellMarkers.length === 0) {
+          return { actions: [], dispose() {} };
+        }
+
+        // Find the active tab whose model matches this one. We can't
+        // store the tab reference on the model because Monaco re-uses
+        // models across split-panel views; we look it up instead.
+        const tab = tabs.value.find(
+          (t) => t.kind === "editor" && t.model === model
+        );
+        if (!tab) return { actions: [], dispose() {} };
+
+        const issues = spellIssuesByTab.get(tab.id) || [];
+        const actions = [];
+        for (const marker of cspellMarkers) {
+          // Pair marker → issue by position. Range comparison is exact
+          // because we built both from the same offsets.
+          const issue = issues.find(
+            (i) =>
+              i.startLineNumber === marker.startLineNumber &&
+              i.startColumn === marker.startColumn &&
+              i.endLineNumber === marker.endLineNumber &&
+              i.endColumn === marker.endColumn
+          );
+          if (!issue || !issue.suggestions || issue.suggestions.length === 0) {
+            continue;
+          }
+          for (const suggestion of issue.suggestions) {
+            actions.push({
+              title: `Replace with "${suggestion}"`,
+              kind: "quickfix",
+              diagnostics: [marker],
+              isPreferred: actions.length === 0,
+              edit: {
+                edits: [
+                  {
+                    // Monaco's IWorkspaceTextEdit shape — newer Monaco
+                    // versions expect `resource` + `textEdit`. We use
+                    // the field names supported across the 0.5x range.
+                    resource: model.uri,
+                    versionId: model.getVersionId(),
+                    textEdit: {
+                      range: {
+                        startLineNumber: issue.startLineNumber,
+                        startColumn: issue.startColumn,
+                        endLineNumber: issue.endLineNumber,
+                        endColumn: issue.endColumn,
+                      },
+                      text: suggestion,
+                    },
+                  },
+                ],
+              },
+            });
+          }
+        }
+
+        return { actions, dispose() {} };
+      },
+    });
+  }
+}
+
 // What the status bar shows on the left. Editor tabs prefer the full file
 // path; if the user hasn't saved yet, fall back to the display filename.
 const statusPath = computed(() => {
@@ -2799,6 +3247,7 @@ const statusPath = computed(() => {
   if (t.kind === "editor") return t.filePath || t.filename;
   if (t.kind === "terminal") return t.filename;
   if (t.kind === "explorer") return t.folderPath;
+  if (t.kind === "git") return t.repoPath;
   return "";
 });
 
@@ -2945,6 +3394,321 @@ function handleDocumentClickForDropdown(event) {
     return;
   closeTabDropdown();
 }
+
+// ---------------------------------------------------------------------------
+// Command Palette (Cmd/Ctrl + Shift + P)
+// ---------------------------------------------------------------------------
+//
+// VS Code–style fuzzy launcher for everything the user can already do from
+// menus and toolbars, plus saved snippets, saved quick actions, and one
+// "Set language: <X>" row per Monaco language. Implementation notes:
+//
+//   - Commands are computed on every open so dynamic items (snippets,
+//     actions, language list, current tab kind) stay fresh.
+//   - The filter is a permissive substring match against the label and the
+//     group. Not full fuzzy; good enough at this scale, and predictable.
+//   - The keydown opener uses capture-phase listening so Monaco's own
+//     Cmd+Shift+P (Monaco ships a built-in command palette) is intercepted
+//     before its handler runs.
+//   - Up/Down/Enter/Esc only fire while the palette is open, and we read
+//     the latest filtered list each time to stay in sync with the query.
+
+const cmdPaletteOpen = ref(false);
+const cmdPaletteQuery = ref("");
+const cmdPaletteIndex = ref(0);
+const cmdPaletteInput = ref(null);
+const cmdPaletteListEl = ref(null);
+
+// Snapshot of available commands at palette-open time. We rebuild it each
+// time the palette opens (cheap; the list is small), so toggling between
+// tabs or saving a new snippet right before opening surfaces the latest.
+const cmdPaletteCommands = ref([]);
+
+function buildPaletteCommands() {
+  const cmds = [];
+
+  // ----- File -----
+  cmds.push({ group: "File", label: "New file", hint: "Ctrl/Cmd+N", run: handleNew });
+  cmds.push({ group: "File", label: "Open file…", hint: "Ctrl/Cmd+O", run: handleOpen });
+  cmds.push({
+    group: "File",
+    label: "Open file by path… (for .env / hidden files)",
+    run: handleOpenByPath,
+  });
+  cmds.push({ group: "File", label: "Save", hint: "Ctrl/Cmd+S", run: handleSave });
+  cmds.push({ group: "File", label: "Save As…", hint: "Ctrl/Cmd+Shift+S", run: handleSaveAs });
+  cmds.push({ group: "File", label: "Close tab", hint: "Ctrl/Cmd+W", run: closeActiveTab });
+  cmds.push({
+    group: "File",
+    label: "Quit Sparrow",
+    hint: "Ctrl/Cmd+Q",
+    run: () => handleCloseRequested({ preventDefault() {} }),
+  });
+
+  // ----- Edit -----
+  cmds.push({ group: "Edit", label: "Find", hint: "Ctrl/Cmd+F", run: handleFind });
+  cmds.push({ group: "Edit", label: "Replace", hint: "Ctrl/Cmd+H", run: handleReplace });
+  cmds.push({ group: "Edit", label: "Go to line…", hint: "Ctrl/Cmd+G", run: handleGotoLine });
+  cmds.push({ group: "Edit", label: "Select all", hint: "Ctrl/Cmd+A", run: handleSelectAll });
+  cmds.push({
+    group: "Edit",
+    label: "Format document",
+    hint: "Shift+Alt+F",
+    run: handleFormatDocument,
+  });
+  cmds.push({ group: "Edit", label: "Format selection", run: handleFormatSelection });
+
+  // ----- View -----
+  cmds.push({
+    group: "View",
+    label: theme.value === "vs-dark" ? "Switch to light theme" : "Switch to dark theme",
+    run: toggleTheme,
+  });
+  cmds.push({
+    group: "View",
+    label: showPreview.value
+      ? "Hide markdown preview"
+      : "Show markdown preview",
+    run: togglePreview,
+  });
+  cmds.push({
+    group: "View",
+    label: wordWrap.value ? "Disable word wrap" : "Enable word wrap",
+    hint: "Alt+Z",
+    run: toggleWordWrap,
+  });
+  cmds.push({
+    group: "View",
+    label: problemsPanelOpen.value
+      ? "Hide Problems panel"
+      : "Show Problems panel",
+    run: toggleProblemsPanel,
+  });
+
+  // Preview-only commands are only meaningful when an editor tab with
+  // a markdown buffer is foregrounded.
+  if (isMarkdownActive.value) {
+    cmds.push({
+      group: "Preview",
+      label: "Copy preview as HTML",
+      run: copyPreviewAsHtml,
+    });
+    cmds.push({
+      group: "Preview",
+      label: "Export preview as PDF…",
+      run: exportPreviewAsPdf,
+    });
+  }
+  cmds.push({
+    group: "View",
+    label: splitView.value ? "Disable split view" : "Enable split view",
+    run: toggleSplitView,
+  });
+
+  // ----- Tabs -----
+  cmds.push({
+    group: "Tabs",
+    label: "Next tab",
+    hint: "Ctrl+Tab",
+    run: () => cycleTab(1),
+  });
+  cmds.push({
+    group: "Tabs",
+    label: "Previous tab",
+    hint: "Ctrl+Shift+Tab",
+    run: () => cycleTab(-1),
+  });
+  cmds.push({
+    group: "Tabs",
+    label: "Show all tabs",
+    run: openTabDropdown,
+  });
+
+  // ----- Tools -----
+  cmds.push({ group: "Tools", label: "New terminal", hint: "Ctrl/Cmd+T", run: handleTerminal });
+  cmds.push({
+    group: "Tools",
+    label: "Open file explorer",
+    hint: "Ctrl/Cmd+Shift+E",
+    run: handleFileExplorer,
+  });
+  cmds.push({
+    group: "Tools",
+    label: "Open Git browser…",
+    run: handleGitBrowser,
+  });
+  cmds.push({
+    group: "Tools",
+    label: "AI Assist on selection",
+    hint: "Ctrl/Cmd+Shift+A",
+    run: handleAiAssist,
+  });
+  cmds.push({ group: "Tools", label: "AI Settings…", run: openAiSettings });
+  cmds.push({ group: "Tools", label: "Quick Actions…", run: openActionsDialog });
+  cmds.push({ group: "Tools", label: "Snippets…", run: openSnippetsDialog });
+  cmds.push({ group: "Tools", label: "Save selection as snippet", run: handleSaveSnippet });
+  cmds.push({
+    group: "Tools",
+    label: "Check for updates",
+    run: () => handleCheckUpdates({ silent: false }),
+  });
+
+  // ----- Language / Syntax -----
+  // Only meaningful when an editor tab is foregrounded — for terminals,
+  // tables, etc., changing language is a no-op so we omit those rows.
+  if (activeTab.value && activeTab.value.kind === "editor") {
+    const current = activeTab.value.language;
+    for (const lang of availableLanguages.value) {
+      if (lang.id === current) continue;
+      cmds.push({
+        group: "Language",
+        label: `Set language: ${lang.label}`,
+        run: () => changeLanguage(lang.id),
+      });
+    }
+  }
+
+  // ----- Quick Actions (dynamic, user-saved) -----
+  for (const a of getActions()) {
+    cmds.push({
+      group: "Run Action",
+      label: a.name + (a.description ? ` — ${a.description}` : ""),
+      run: () => runAction(a),
+    });
+  }
+
+  // ----- Snippets (dynamic, user-saved) -----
+  for (const s of getSnippets()) {
+    const verb = s.type === "prompt" ? "Run prompt" : "Insert snippet";
+    cmds.push({
+      group: s.type === "prompt" ? "Prompt" : "Snippet",
+      label: `${verb}: ${s.name}` + (s.description ? ` — ${s.description}` : ""),
+      run: () => pickSnippet(s),
+    });
+  }
+
+  return cmds;
+}
+
+const filteredPaletteCommands = computed(() => {
+  const q = cmdPaletteQuery.value.trim().toLowerCase();
+  const all = cmdPaletteCommands.value;
+  if (!q) return all;
+  // Token-AND substring match — every whitespace-separated token must
+  // appear in either the label or the group. Lets "snip py" match
+  // "Insert snippet: python-shebang" without forcing exact ordering.
+  const tokens = q.split(/\s+/).filter(Boolean);
+  return all.filter((c) => {
+    const hay = (c.group + " " + c.label).toLowerCase();
+    return tokens.every((t) => hay.includes(t));
+  });
+});
+
+// Keep the highlighted row inside the visible portion of the scroll list as
+// the user arrows up/down past the viewport edge.
+function scrollPaletteSelectedIntoView() {
+  nextTick(() => {
+    if (!cmdPaletteListEl.value) return;
+    const items = cmdPaletteListEl.value.querySelectorAll(".cmd-item");
+    const el = items[cmdPaletteIndex.value];
+    if (el) el.scrollIntoView({ block: "nearest" });
+  });
+}
+
+function openCommandPalette() {
+  // Refresh dynamic items (snippets / actions / language list) on every
+  // open so the palette always reflects current storage state.
+  cmdPaletteCommands.value = buildPaletteCommands();
+  cmdPaletteOpen.value = true;
+  cmdPaletteQuery.value = "";
+  cmdPaletteIndex.value = 0;
+  nextTick(() => {
+    if (cmdPaletteInput.value) cmdPaletteInput.value.focus();
+  });
+}
+
+function closeCommandPalette() {
+  cmdPaletteOpen.value = false;
+}
+
+function runPaletteCommand(cmd) {
+  closeCommandPalette();
+  if (!cmd) return;
+  try {
+    cmd.run();
+  } catch (err) {
+    console.error("[palette] command failed:", err);
+    flashStatus(`Command failed: ${err}`);
+  }
+}
+
+// Reset the cursor when the filter narrows; clamp if items disappear.
+watch([cmdPaletteQuery, filteredPaletteCommands], () => {
+  const len = filteredPaletteCommands.value.length;
+  if (cmdPaletteIndex.value >= len) {
+    cmdPaletteIndex.value = Math.max(0, len - 1);
+  }
+});
+
+// Capture-phase listener so we beat Monaco's built-in Cmd+Shift+P (which
+// also opens a command palette — but that one only knows about editor
+// actions; ours covers the whole app).
+function handleCommandPaletteKey(event) {
+  const mod = event.metaKey || event.ctrlKey;
+
+  // Word wrap: Alt+Z (VS Code's shortcut). Only when no editor modifier
+  // is held so we don't fight common Alt-combos. Skip when a modal is up.
+  if (
+    !mod &&
+    event.altKey &&
+    !event.shiftKey &&
+    (event.key === "z" || event.key === "Z") &&
+    !isModalChromeOpen()
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleWordWrap();
+    return;
+  }
+
+  // Open shortcut: Cmd/Ctrl + Shift + P. We check `event.code === "KeyP"`
+  // in addition to `event.key` because some Windows layouts (notably
+  // non-US ones) report a different `event.key` when modifiers are
+  // pressed. `event.code` is the physical key and is layout-stable.
+  if (
+    mod &&
+    event.shiftKey &&
+    (event.code === "KeyP" || event.key === "P" || event.key === "p")
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (cmdPaletteOpen.value) closeCommandPalette();
+    else openCommandPalette();
+    return;
+  }
+
+  // While open: arrow keys, Enter, Escape.
+  if (!cmdPaletteOpen.value) return;
+  const list = filteredPaletteCommands.value;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeCommandPalette();
+  } else if (event.key === "ArrowDown") {
+    event.preventDefault();
+    if (list.length === 0) return;
+    cmdPaletteIndex.value = (cmdPaletteIndex.value + 1) % list.length;
+    scrollPaletteSelectedIntoView();
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    if (list.length === 0) return;
+    cmdPaletteIndex.value =
+      (cmdPaletteIndex.value - 1 + list.length) % list.length;
+    scrollPaletteSelectedIntoView();
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    runPaletteCommand(list[cmdPaletteIndex.value]);
+  }
+}
 </script>
 
 <template>
@@ -2967,6 +3731,20 @@ function handleDocumentClickForDropdown(event) {
         title="Save As (Ctrl/Cmd+Shift+S)"
       ><FileDown :size="14" /></button>
       <button
+        class="tb-btn"
+        @click="cycleTab(-1)"
+        :disabled="tabs.length < 2"
+        title="Previous tab (Ctrl+Shift+Tab)"
+        aria-label="Previous tab"
+      ><ChevronLeft :size="14" /></button>
+      <button
+        class="tb-btn"
+        @click="cycleTab(1)"
+        :disabled="tabs.length < 2"
+        title="Next tab (Ctrl+Tab)"
+        aria-label="Next tab"
+      ><ChevronRight :size="14" /></button>
+      <button
         class="tb-btn tb-term"
         @click="handleTerminal"
         title="Open Terminal (Ctrl/Cmd+T)"
@@ -2976,6 +3754,11 @@ function handleDocumentClickForDropdown(event) {
         @click="handleFileExplorer"
         title="Open File Explorer (Ctrl/Cmd+Shift+E)"
       ><FolderTree :size="14" /></button>
+      <button
+        class="tb-btn tb-git"
+        @click="handleGitBrowser"
+        title="Open Git browser (status / stage / commit / pull / push)"
+      ><GitBranch :size="14" /></button>
       <button
         class="tb-btn tb-whiteboard"
         @click="handleNewWhiteboard"
@@ -3160,15 +3943,33 @@ function handleDocumentClickForDropdown(event) {
       <!--
         Markdown preview pane. Lives at the right half of the content area
         when an .md tab is active and the user hasn't toggled preview off.
-        `v-html` consumes markdown-it's escaped output (html: false in the
-        renderer config means raw HTML in the source is dropped).
+        The preview itself uses v-html to render markdown-it's escaped
+        output (html: false in the renderer config means raw HTML in the
+        source is dropped). A slim toolbar above it offers Copy-as-HTML
+        and Print-as-PDF, both of which act on the currently rendered DOM
+        so what you see in the preview is exactly what gets exported.
       -->
-      <div
-        v-show="showPreviewActive"
-        ref="previewPaneEl"
-        class="md-preview"
-        v-html="previewHtml"
-      ></div>
+      <div v-show="showPreviewActive" class="md-preview-wrap">
+        <div class="md-preview-toolbar">
+          <button
+            class="tb-btn"
+            @click="copyPreviewAsHtml"
+            title="Copy rendered HTML to clipboard"
+            aria-label="Copy as HTML"
+          ><ClipboardCopy :size="13" /></button>
+          <button
+            class="tb-btn"
+            @click="exportPreviewAsPdf"
+            title="Print preview to PDF (use the system print dialog's 'Save as PDF')"
+            aria-label="Print as PDF"
+          ><Printer :size="13" /></button>
+        </div>
+        <div
+          ref="previewPaneEl"
+          class="md-preview"
+          v-html="previewHtml"
+        ></div>
+      </div>
 
       <!--
         Split-view right pane. Independent Monaco instance that views any
@@ -3233,6 +4034,26 @@ function handleDocumentClickForDropdown(event) {
       </div>
 
       <!--
+        Git browser tabs. Each is bound to a repo path; the GitTab
+        component runs status / add / commit / pull / push commands
+        through Rust. We mount them all and toggle visibility with
+        v-show so an in-flight commit message survives a tab switch.
+      -->
+      <div
+        v-for="tab in gitTabsList"
+        :key="tab.id"
+        v-show="tab.id === activeTabId"
+        class="git-wrap"
+      >
+        <GitTab
+          :repo-path="tab.repoPath"
+          :active="tab.id === activeTabId"
+          @open-file="openFileFromExplorer"
+          @title-change="(title) => { tab.filename = title; refreshTabsList(); }"
+        />
+      </div>
+
+      <!--
         Table tabs (CSV / XLSX). Each renders a Tabulator instance and
         stays mounted across tab switches via v-show. The function ref
         keeps a per-tab handle so the parent can call `serialize()` at
@@ -3293,6 +4114,65 @@ function handleDocumentClickForDropdown(event) {
       </div>
     </div>
 
+    <!-- ============================================================
+         Problems panel — collapsible bottom drawer listing every
+         spell-check issue in the active tab. Each row is a click
+         target (jumps to the position) with inline chips for the
+         top suggestions (each chip replaces the word on click).
+         ============================================================ -->
+    <div v-if="problemsPanelOpen" class="problems-panel">
+      <div class="problems-header">
+        <span class="problems-title">
+          <AlertTriangle :size="13" />
+          Problems
+          <span
+            v-if="activeTabSpellIssues.length"
+            class="problems-count"
+          >{{ activeTabSpellIssues.length }}</span>
+        </span>
+        <button
+          class="problems-close"
+          @click="toggleProblemsPanel"
+          title="Hide problems panel"
+          aria-label="Hide problems panel"
+        ><X :size="14" /></button>
+      </div>
+      <div v-if="activeTabSpellIssues.length === 0" class="problems-empty">
+        No spelling issues in this tab.
+      </div>
+      <div v-else class="problems-list">
+        <div
+          v-for="issue in activeTabSpellIssues"
+          :key="issue.offset + ':' + issue.text"
+          class="problem-row"
+        >
+          <span
+            class="problem-location"
+            @click="jumpToSpellIssue(issue)"
+            :title="`Jump to line ${issue.startLineNumber}, column ${issue.startColumn}`"
+          >
+            {{ issue.startLineNumber }}:{{ issue.startColumn }}
+          </span>
+          <span class="problem-word" @click="jumpToSpellIssue(issue)">
+            {{ issue.text }}
+          </span>
+          <span class="problem-fixes">
+            <button
+              v-for="s in issue.suggestions"
+              :key="s"
+              class="problem-suggest"
+              @click="replaceSpellIssue(issue, s)"
+              :title="`Replace with '${s}'`"
+            >{{ s }}</button>
+            <span
+              v-if="!issue.suggestions || issue.suggestions.length === 0"
+              class="problem-no-suggest"
+            >no suggestions</span>
+          </span>
+        </div>
+      </div>
+    </div>
+
     <!-- Bottom status bar -->
     <div class="status-bar">
       <div class="status-left">
@@ -3309,6 +4189,26 @@ function handleDocumentClickForDropdown(event) {
       </div>
       <div class="status-right">
         <template v-if="activeTab && activeTab.kind === 'editor'">
+          <button
+            v-if="isSpellCheckable(activeTab)"
+            class="status-problems"
+            :class="{ on: problemsPanelOpen, 'has-issues': activeTabSpellIssues.length > 0 }"
+            @click="toggleProblemsPanel"
+            :title="`${activeTabSpellIssues.length} spelling issue${activeTabSpellIssues.length === 1 ? '' : 's'} — click to ${problemsPanelOpen ? 'hide' : 'show'} the Problems panel`"
+            aria-label="Toggle problems panel"
+          >
+            <AlertTriangle :size="13" />
+            <span class="status-problems-count">
+              {{ activeTabSpellIssues.length }}
+            </span>
+          </button>
+          <button
+            class="status-toggle"
+            :class="{ on: wordWrap }"
+            @click="toggleWordWrap"
+            :title="`Word wrap: ${wordWrap ? 'on' : 'off'} (Alt+Z)`"
+            aria-label="Toggle word wrap"
+          ><WrapText :size="13" /></button>
           <span class="status-label">Syntax</span>
           <select
             class="status-lang"
@@ -3331,13 +4231,59 @@ function handleDocumentClickForDropdown(event) {
     </div>
 
     <!-- ============================================================
+         Command Palette — VS Code–style fuzzy launcher.
+         Opens with Cmd/Ctrl+Shift+P. Combines static commands (file
+         ops, edit actions, view toggles, tools) with dynamic items
+         (every saved snippet, quick action, and Monaco language).
+         ============================================================ -->
+    <div
+      v-if="cmdPaletteOpen"
+      class="cmd-palette-overlay"
+    >
+      <div class="cmd-palette" role="dialog" aria-label="Command palette">
+        <div class="cmd-palette-input-row">
+          <Search :size="14" class="cmd-palette-search-icon" />
+          <input
+            ref="cmdPaletteInput"
+            v-model="cmdPaletteQuery"
+            class="cmd-palette-input"
+            placeholder="Type a command, snippet, or action…"
+            spellcheck="false"
+            autocorrect="off"
+            autocapitalize="off"
+            autocomplete="off"
+          />
+        </div>
+        <div
+          v-if="filteredPaletteCommands.length === 0"
+          class="cmd-palette-empty"
+        >
+          No matching commands.
+        </div>
+        <div v-else ref="cmdPaletteListEl" class="cmd-palette-list">
+          <div
+            v-for="(cmd, idx) in filteredPaletteCommands"
+            :key="cmd.group + cmd.label"
+            class="cmd-item"
+            :class="{ active: idx === cmdPaletteIndex }"
+            @click="runPaletteCommand(cmd)"
+            @mousemove="cmdPaletteIndex = idx"
+          >
+            <span class="cmd-item-group">{{ cmd.group }}</span>
+            <span class="cmd-item-label">{{ cmd.label }}</span>
+            <span v-if="cmd.hint" class="cmd-item-hint">{{ cmd.hint }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================
          AI Assist modal — appears when the user invokes AI on a
          non-empty selection.
          ============================================================ -->
     <div
       v-if="aiDialogOpen"
       class="modal-overlay"
-      @click.self="closeAiDialog"
     >
       <div class="modal">
         <div class="modal-header">
@@ -3386,7 +4332,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="aiSettingsOpen"
       class="modal-overlay"
-      @click.self="closeAiSettings"
     >
       <div class="modal">
         <div class="modal-header">
@@ -3457,7 +4402,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="saveSnippetDialogOpen"
       class="modal-overlay"
-      @click.self="saveSnippetDialogOpen = false"
     >
       <div class="modal">
         <div class="modal-header">
@@ -3513,6 +4457,10 @@ function handleDocumentClickForDropdown(event) {
               v-model="snippetDraft.content"
               rows="5"
               placeholder="e.g. Rewrite this paragraph more concisely · Translate to Spanish · Add type annotations to this function"
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
+              autocomplete="off"
             ></textarea>
             <div class="action-vars-hint">
               When run, the editor's current selection (if any) is sent
@@ -3528,6 +4476,10 @@ function handleDocumentClickForDropdown(event) {
               rows="8"
               class="snippet-content-input"
               placeholder="Paste or type the snippet text…"
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
+              autocomplete="off"
             ></textarea>
           </template>
         </div>
@@ -3550,7 +4502,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="snippetsDialogOpen"
       class="modal-overlay"
-      @click.self="snippetsDialogOpen = false"
     >
       <div class="modal modal-snippets">
         <div class="modal-header">
@@ -3643,7 +4594,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="actionsDialogOpen"
       class="modal-overlay"
-      @click.self="actionsDialogOpen = false"
     >
       <div class="modal modal-snippets">
         <div class="modal-header">
@@ -3733,7 +4683,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="updateDialogOpen"
       class="modal-overlay"
-      @click.self="dismissUpdate"
     >
       <div class="modal">
         <div class="modal-header">
@@ -3857,7 +4806,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="closeConfirmOpen"
       class="modal-overlay"
-      @click.self="cancelClose"
     >
       <div class="modal">
         <div class="modal-header">
@@ -3911,7 +4859,6 @@ function handleDocumentClickForDropdown(event) {
     <div
       v-if="newActionDialogOpen"
       class="modal-overlay"
-      @click.self="newActionDialogOpen = false"
     >
       <div class="modal">
         <div class="modal-header">
@@ -3956,6 +4903,10 @@ function handleDocumentClickForDropdown(event) {
               v-model="actionDraft.command"
               rows="3"
               placeholder='e.g. npm test, eslint "{file}", grep -r "{selection}" "{dir}"'
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
+              autocomplete="off"
             ></textarea>
             <div class="action-vars-hint">
               Use
@@ -3973,6 +4924,10 @@ function handleDocumentClickForDropdown(event) {
               <input
                 v-model="actionDraft.scriptPath"
                 placeholder="/path/to/script.py"
+                spellcheck="false"
+                autocorrect="off"
+                autocapitalize="off"
+                autocomplete="off"
               />
               <button
                 type="button"
@@ -3986,6 +4941,10 @@ function handleDocumentClickForDropdown(event) {
             <input
               v-model="actionDraft.args"
               placeholder='e.g. --pretty "{file}"'
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
+              autocomplete="off"
             />
 
             <div class="action-vars-hint">
@@ -4481,12 +5440,34 @@ function handleDocumentClickForDropdown(event) {
   min-height: 0;
 }
 
-.md-preview {
+/* Preview wrap is what's positioned now; the inner `.md-preview` fills
+   it below a slim toolbar so Copy-as-HTML / Print-as-PDF have a home
+   without crowding the page content. */
+.md-preview-wrap {
   position: absolute;
   top: 0;
   bottom: 0;
   left: 50%;
   right: 0;
+  display: flex;
+  flex-direction: column;
+  background: #1e1e1e;
+  border-left: 1px solid #1a1a1a;
+}
+
+.md-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #252526;
+  border-bottom: 1px solid #1a1a1a;
+  flex: 0 0 auto;
+}
+
+.md-preview {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 18px 24px 40px 24px;
   background: #1e1e1e;
@@ -4691,6 +5672,12 @@ function handleDocumentClickForDropdown(event) {
   background: #1e1e1e;
 }
 
+.git-wrap {
+  position: absolute;
+  inset: 0;
+  background: #1e1e1e;
+}
+
 .preview-wrap {
   position: absolute;
   inset: 0;
@@ -4783,6 +5770,196 @@ function handleDocumentClickForDropdown(event) {
   line-height: 0;
 }
 
+/* Problems badge in the status bar. Dim by default, lights up amber when
+   the active tab has spelling issues, and switches to a "pressed" look
+   while the Problems panel is open so the toggle state is obvious. */
+.status-problems {
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1;
+  margin-right: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.status-problems:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.status-problems.has-issues {
+  color: #d8a05a;
+}
+.status-problems.on {
+  background: rgba(216, 160, 90, 0.18);
+  color: #f0c98a;
+}
+.status-problems-count {
+  font-size: 11px;
+}
+
+/* Problems panel — bottom drawer between the content area and the
+   status bar. Fixed-ish height with internal scroll so it doesn't push
+   the editor too small on a short window. */
+.problems-panel {
+  flex: 0 0 auto;
+  max-height: 200px;
+  display: flex;
+  flex-direction: column;
+  background: #252526;
+  border-top: 1px solid #1a1a1a;
+}
+
+.problems-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px;
+  background: #2d2d2e;
+  border-bottom: 1px solid #1a1a1a;
+  flex: 0 0 auto;
+}
+
+.problems-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #cccccc;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.problems-count {
+  font-size: 11px;
+  font-weight: 500;
+  background: #3a3a3a;
+  color: #d4d4d4;
+  padding: 1px 6px;
+  border-radius: 8px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.problems-close {
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  line-height: 0;
+}
+.problems-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ccc;
+}
+
+.problems-empty {
+  padding: 14px;
+  color: #888;
+  font-size: 12px;
+  text-align: center;
+}
+
+.problems-list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.problem-row {
+  display: grid;
+  grid-template-columns: 60px 160px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: #d4d4d4;
+}
+.problem-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.problem-location {
+  color: #888;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
+}
+.problem-location:hover {
+  color: #ccc;
+  text-decoration: underline;
+}
+
+.problem-word {
+  color: #d8a05a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.problem-word:hover {
+  text-decoration: underline;
+}
+
+.problem-fixes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.problem-suggest {
+  background: #3a3a3a;
+  color: #d4d4d4;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1.5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.problem-suggest:hover {
+  background: #4a4a4a;
+  border-color: #6fa8dc;
+}
+
+.problem-no-suggest {
+  color: #777;
+  font-style: italic;
+  font-size: 11px;
+}
+
+/* Small toggle button used for word-wrap in the status bar. Highlights
+   when the feature is on so the active state is visible at a glance. */
+.status-toggle {
+  background: transparent;
+  border: none;
+  color: #aaaaaa;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  box-shadow: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  margin-right: 4px;
+}
+.status-toggle.on {
+  color: #4fc3f7;
+}
+.status-toggle:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .status-copy:hover {
   background: rgba(255, 255, 255, 0.1);
   color: #ffffff;
@@ -4833,6 +6010,125 @@ function handleDocumentClickForDropdown(event) {
   align-items: center;
   justify-content: center;
   z-index: 1000;
+}
+
+/* --- Command Palette ---
+   Top-anchored dimmed overlay + a narrow panel. Visually distinct from
+   the heavier centered modals — feels closer to VS Code / Slack / Linear
+   palettes. The list scrolls inside the panel; the input stays pinned. */
+.cmd-palette-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: center;
+  padding-top: 14vh;
+  z-index: 1100; /* above other modals so it's always reachable */
+}
+
+.cmd-palette {
+  background: #252526;
+  border: 1px solid #1a1a1a;
+  border-radius: 8px;
+  width: 600px;
+  max-width: 92vw;
+  max-height: 64vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.cmd-palette-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #1a1a1a;
+  background: #2d2d2e;
+}
+
+.cmd-palette-search-icon {
+  color: #888;
+  flex-shrink: 0;
+}
+
+.cmd-palette-input {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: #d4d4d4;
+  font-size: 14px;
+  font-family: inherit;
+  padding: 2px 0;
+}
+
+.cmd-palette-input::placeholder {
+  color: #888;
+}
+
+.cmd-palette-empty {
+  padding: 20px;
+  color: #888;
+  text-align: center;
+  font-size: 13px;
+}
+
+.cmd-palette-list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.cmd-item {
+  display: grid;
+  grid-template-columns: 90px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #d4d4d4;
+  line-height: 1.4;
+}
+
+.cmd-item.active {
+  background: #0a6cbd;
+  color: #fff;
+}
+
+.cmd-item-group {
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cmd-item.active .cmd-item-group {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.cmd-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cmd-item-hint {
+  font-size: 11px;
+  color: #888;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 1px 6px;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+}
+
+.cmd-item.active .cmd-item-hint {
+  color: rgba(255, 255, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.4);
 }
 
 .modal {
@@ -5568,5 +6864,154 @@ function handleDocumentClickForDropdown(event) {
   justify-content: center;
   color: #888;
   font-size: 14px;
+}
+</style>
+
+<!--
+  Print stylesheet for the "Export preview as PDF" command. This block
+  is intentionally NOT scoped — Vue's scoped attribute selectors only
+  apply to elements in the component's own tree, but print rules need
+  to target the root <html>/<body> as well as universal selectors.
+
+  Activation: `exportPreviewAsPdf()` sets `printing-preview` on the
+  <html> element right before calling `window.print()`. The `afterprint`
+  event clears it. The body of these rules hides every chrome surface
+  (toolbar, tabs, status bar, split editor, problems panel, modals)
+  and promotes the markdown preview pane to fill the page with paper-
+  friendly light styling.
+-->
+<style>
+@media print {
+  html.printing-preview,
+  html.printing-preview body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #222 !important;
+    overflow: visible !important;
+    width: auto !important;
+    height: auto !important;
+  }
+
+  /* Hide every UI surface that isn't the preview pane. We list them
+     explicitly so a future stray top-level container doesn't sneak
+     through; a blanket `body > * { display: none }` would also hide
+     the editor host that contains the preview. */
+  html.printing-preview .toolbar,
+  html.printing-preview .tab-header,
+  html.printing-preview .status-bar,
+  html.printing-preview .problems-panel,
+  html.printing-preview .right-panel,
+  html.printing-preview .editor-host,
+  html.printing-preview .editor-host-right,
+  html.printing-preview .md-preview-toolbar,
+  html.printing-preview .modal-overlay,
+  html.printing-preview .cmd-palette-overlay,
+  html.printing-preview .empty-state,
+  html.printing-preview .explorer-wrap,
+  html.printing-preview .table-wrap,
+  html.printing-preview .whiteboard-wrap,
+  html.printing-preview .git-wrap,
+  html.printing-preview .terminal-wrap {
+    display: none !important;
+  }
+
+  /* Promote the preview pane to fill the printable page. We strip the
+     absolute-positioning that places it on the right half of the
+     content area during normal use. */
+  html.printing-preview .editor-shell,
+  html.printing-preview .content,
+  html.printing-preview .md-preview-wrap {
+    position: static !important;
+    inset: auto !important;
+    width: auto !important;
+    height: auto !important;
+    border: none !important;
+    background: #ffffff !important;
+    display: block !important;
+    overflow: visible !important;
+  }
+
+  html.printing-preview .md-preview {
+    position: static !important;
+    inset: auto !important;
+    width: auto !important;
+    max-width: 720px !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #222 !important;
+    overflow: visible !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+      system-ui, sans-serif !important;
+    line-height: 1.55 !important;
+  }
+
+  /* Code blocks: paper-friendly light box with dark text. We override
+     highlight.js's dark theme so syntax highlighting still works but
+     remains readable on white paper. */
+  html.printing-preview .md-preview pre,
+  html.printing-preview .md-preview pre.hljs {
+    background: #f5f5f5 !important;
+    color: #222 !important;
+    padding: 10px 12px !important;
+    border-radius: 6px !important;
+    page-break-inside: avoid;
+    overflow: visible !important;
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+  }
+  html.printing-preview .md-preview code {
+    background: #f0f0f0 !important;
+    color: #222 !important;
+    padding: 0 4px !important;
+    border-radius: 3px !important;
+  }
+  html.printing-preview .md-preview pre code {
+    background: transparent !important;
+    padding: 0 !important;
+  }
+  /* Strip highlight.js token colors during print so everything stays
+     readable. Users who really want colored syntax in print can lift
+     this rule, but the default is "monochrome and legible". */
+  html.printing-preview .md-preview .hljs,
+  html.printing-preview .md-preview .hljs * {
+    color: #222 !important;
+    background: transparent !important;
+  }
+
+  html.printing-preview .md-preview img {
+    max-width: 100% !important;
+    height: auto !important;
+  }
+  html.printing-preview .md-preview table {
+    border-collapse: collapse !important;
+  }
+  html.printing-preview .md-preview th,
+  html.printing-preview .md-preview td {
+    border: 1px solid #cccccc !important;
+    padding: 6px 10px !important;
+  }
+  html.printing-preview .md-preview blockquote {
+    border-left: 3px solid #aaaaaa !important;
+    margin: 0 !important;
+    padding: 4px 12px !important;
+    color: #555555 !important;
+    background: transparent !important;
+  }
+  html.printing-preview .md-preview h1,
+  html.printing-preview .md-preview h2,
+  html.printing-preview .md-preview h3,
+  html.printing-preview .md-preview h4 {
+    margin-top: 1.4em !important;
+    color: #222 !important;
+    page-break-after: avoid;
+  }
+  /* Mermaid diagrams render as inline SVG; preserve them but keep
+     within page width. */
+  html.printing-preview .md-preview svg {
+    max-width: 100% !important;
+    height: auto !important;
+  }
 }
 </style>

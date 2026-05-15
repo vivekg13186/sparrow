@@ -5,21 +5,126 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:webview:allow-print",
     "opener:default",
     "opener:allow-open-path",
     "opener:allow-reveal-item-in-dir",
     "dialog:default",
     "fs:default",
-    "fs:allow-read-text-file",
-    "fs:allow-write-text-file",
-    "fs:allow-read-file",
-    "fs:allow-write-file",
-    "fs:allow-mkdir",
-    "fs:allow-remove",
-    "fs:allow-read-dir",
-    "fs:allow-exists",
     "fs:scope-applocaldata-recursive",
     "fs:scope-appconfig-recursive",
+    {
+      "identifier": "fs:allow-read-text-file",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-dir",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-remove",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-exists",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "/Users/**" },
+        { "path": "/home/**" },
+        { "path": "/Volumes/**" },
+        { "path": "/mnt/**" },
+        { "path": "/media/**" },
+        { "path": "/tmp/**" },
+        { "path": "**/*" },
+        { "path": "**" }
+      ]
+    },
     "updater:default",
     "process:default"
   ]

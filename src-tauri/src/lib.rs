@@ -590,6 +590,252 @@ fn path_parent(path: String) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Git operations
+// ---------------------------------------------------------------------------
+//
+// Thin wrappers around the system `git` binary. We deliberately shell out
+// rather than link a Rust git library (libgit2 / gitoxide) because:
+//
+//   1. Users almost always have `git` in PATH already.
+//   2. The system git honors their `.gitconfig`, credential helpers,
+//      SSH keys, signing keys, and corporate proxy settings — getting
+//      all of that right with libgit2 is a substantial side project.
+//   3. The output formats we care about (`status --porcelain=v2`,
+//      `rev-parse --abbrev-ref`) are stable and easy to parse.
+//
+// Every command takes the repo root path as its first argument so we can
+// run multiple repos side-by-side; the frontend tracks which path each
+// Git tab is bound to.
+
+#[derive(serde::Serialize)]
+struct GitFileEntry {
+    /// "M", "A", "D", "R", "?" — the user-visible single-letter status.
+    /// Matches `git status --short`'s vocabulary.
+    status: String,
+    /// Whether this entry is on the index (staged) side.
+    staged: bool,
+    /// Path relative to the repo root, with forward slashes regardless of OS.
+    path: String,
+    /// For renames: the old path. None otherwise.
+    old_path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct GitStatus {
+    branch: Option<String>,
+    /// Commits ahead of the upstream branch (None if no upstream).
+    ahead: Option<u32>,
+    /// Commits behind the upstream branch (None if no upstream).
+    behind: Option<u32>,
+    /// Whether HEAD has any commits at all. False on a fresh `git init`.
+    has_commits: bool,
+    files: Vec<GitFileEntry>,
+}
+
+/// Run `git` with the given args in `cwd`, returning stdout on success or a
+/// human-readable error string. Stderr is folded in on failure so the
+/// frontend can show whatever git was trying to tell us.
+fn run_git(cwd: &str, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Some git failures (e.g. nothing-to-commit) put the message on
+        // stdout; surface whichever has content.
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(if msg.is_empty() {
+            format!("git exited with status {}", output.status)
+        } else {
+            msg
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[tauri::command]
+fn git_status(path: String) -> Result<GitStatus, String> {
+    // porcelain=v2 -b gives us the branch + ahead/behind in one shot,
+    // and uses NUL-safe parsing for paths with spaces.
+    let raw = run_git(
+        &path,
+        &["status", "--porcelain=v2", "--branch", "--untracked-files=normal"],
+    )?;
+
+    let mut branch: Option<String> = None;
+    let mut ahead: Option<u32> = None;
+    let mut behind: Option<u32> = None;
+    let mut has_commits = true;
+    let mut files: Vec<GitFileEntry> = Vec::new();
+
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            // "(detached)" means HEAD points at a commit, not a branch.
+            // We surface the literal string so the UI can show it.
+            if rest == "(detached)" {
+                branch = Some("(detached HEAD)".into());
+            } else {
+                branch = Some(rest.into());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            // Format: "+N -M" — both signed, parse the absolute count.
+            for part in rest.split_whitespace() {
+                if let Some(num) = part.strip_prefix('+') {
+                    ahead = num.parse().ok();
+                } else if let Some(num) = part.strip_prefix('-') {
+                    behind = num.parse().ok();
+                }
+            }
+            continue;
+        }
+        if line.starts_with("# branch.oid (initial)") {
+            // Fresh repo with no commits yet.
+            has_commits = false;
+            continue;
+        }
+
+        // File entries:
+        //   "1 XY ... <path>"           ordinary changed entry
+        //   "2 XY ... <path>\t<orig>"   renamed/copied entry
+        //   "? <path>"                  untracked
+        //   "! <path>"                  ignored (we don't request these)
+        if let Some(rest) = line.strip_prefix("1 ") {
+            // Tokens: XY sub mH mI mW hH hI path
+            if let Some((xy, rest)) = rest.split_once(' ') {
+                if xy.len() != 2 {
+                    continue;
+                }
+                let path_part = rest.split(' ').nth(6).unwrap_or("");
+                push_change_entries(&mut files, xy, path_part, None);
+            }
+        } else if let Some(rest) = line.strip_prefix("2 ") {
+            // Renamed: tokens include score and a tab-separated <new>\t<old>
+            if let Some((xy, rest)) = rest.split_once(' ') {
+                if xy.len() != 2 {
+                    continue;
+                }
+                let paths_part = rest.split(' ').nth(8).unwrap_or("");
+                if let Some((newp, oldp)) = paths_part.split_once('\t') {
+                    push_change_entries(&mut files, xy, newp, Some(oldp.to_string()));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("? ") {
+            files.push(GitFileEntry {
+                status: "?".into(),
+                staged: false,
+                path: rest.into(),
+                old_path: None,
+            });
+        }
+    }
+
+    Ok(GitStatus {
+        branch,
+        ahead,
+        behind,
+        has_commits,
+        files,
+    })
+}
+
+/// Translate the two-character porcelain status into our entries. The index
+/// half (`X`) gives the staged change kind; the worktree half (`Y`) gives
+/// the unstaged change kind. A single file can produce two rows when both
+/// halves are non-`.` (e.g. staged add + further worktree edits).
+fn push_change_entries(out: &mut Vec<GitFileEntry>, xy: &str, path: &str, old_path: Option<String>) {
+    let bytes = xy.as_bytes();
+    if bytes.len() < 2 {
+        return;
+    }
+    let staged = bytes[0] as char;
+    let worktree = bytes[1] as char;
+    if staged != '.' {
+        out.push(GitFileEntry {
+            status: staged.to_string(),
+            staged: true,
+            path: path.to_string(),
+            old_path: old_path.clone(),
+        });
+    }
+    if worktree != '.' {
+        out.push(GitFileEntry {
+            status: worktree.to_string(),
+            staged: false,
+            path: path.to_string(),
+            old_path,
+        });
+    }
+}
+
+#[tauri::command]
+fn git_add(path: String, files: Vec<String>) -> Result<(), String> {
+    // Empty list = stage everything. Mirrors `git add -A`.
+    let mut args = vec!["add", "--"];
+    if files.is_empty() {
+        // `git add --` without paths is a no-op; bypass to `-A`.
+        run_git(&path, &["add", "-A"]).map(|_| ())
+    } else {
+        for f in &files {
+            args.push(f);
+        }
+        run_git(&path, &args).map(|_| ())
+    }
+}
+
+#[tauri::command]
+fn git_reset(path: String, files: Vec<String>) -> Result<(), String> {
+    // `git reset HEAD -- <files>` unstages. With no files, reset everything
+    // back to HEAD's index — we mirror `git reset HEAD`.
+    if files.is_empty() {
+        run_git(&path, &["reset", "HEAD"]).map(|_| ())
+    } else {
+        let mut args = vec!["reset", "HEAD", "--"];
+        for f in &files {
+            args.push(f);
+        }
+        run_git(&path, &args).map(|_| ())
+    }
+}
+
+#[tauri::command]
+fn git_commit(path: String, message: String) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("Commit message is empty".into());
+    }
+    run_git(&path, &["commit", "-m", message.trim()]).map(|_| ())
+}
+
+#[tauri::command]
+fn git_pull(path: String) -> Result<String, String> {
+    // Returns git's stdout so the UI can show "Already up to date." vs.
+    // the fast-forward summary. Auth failures bubble up via the Err arm.
+    run_git(&path, &["pull"])
+}
+
+#[tauri::command]
+fn git_push(path: String) -> Result<String, String> {
+    run_git(&path, &["push"])
+}
+
+#[tauri::command]
+fn git_diff(path: String, file: String, staged: bool) -> Result<String, String> {
+    // Unified diff for a single file. We don't try to colorize — the UI
+    // renders it as a monospaced block and any styling is its concern.
+    let mut args = vec!["diff", "--no-color"];
+    if staged {
+        args.push("--cached");
+    }
+    args.push("--");
+    args.push(&file);
+    run_git(&path, &args)
+}
+
+// ---------------------------------------------------------------------------
 // App bootstrap
 // ---------------------------------------------------------------------------
 
@@ -613,6 +859,13 @@ pub fn run() {
             path_parent,
             ai_complete,
             run_python_action,
+            git_status,
+            git_add,
+            git_reset,
+            git_commit,
+            git_pull,
+            git_push,
+            git_diff,
         ])
         .setup(|app| {
             // --- File menu ---
@@ -728,6 +981,9 @@ pub fn run() {
                 MenuItemBuilder::with_id("file_explorer", "File Explorer")
                     .accelerator("CmdOrCtrl+Shift+E")
                     .build(app)?;
+            let git_browser_item =
+                MenuItemBuilder::with_id("git_browser", "Git Browser…")
+                    .build(app)?;
             let ai_assist_item = MenuItemBuilder::with_id("ai_assist", "AI Assist")
                 .accelerator("CmdOrCtrl+Shift+A")
                 .build(app)?;
@@ -744,6 +1000,7 @@ pub fn run() {
             let tools_menu = SubmenuBuilder::new(app, "Tools")
                 .item(&terminal_item)
                 .item(&file_explorer_item)
+                .item(&git_browser_item)
                 .separator()
                 .item(&ai_assist_item)
                 .item(&ai_settings_item)

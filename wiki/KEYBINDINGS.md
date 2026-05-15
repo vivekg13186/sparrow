@@ -55,6 +55,8 @@ arrow shortcuts above or via the dropdown search.
 | Go to line | `Cmd/Ctrl + G` |
 | Format Document | `Shift + Alt + F` |
 | Format Selection | `Cmd/Ctrl + K`, then `Cmd/Ctrl + F` |
+| Toggle word wrap | `Alt + Z` |
+| Quick Fix (spelling suggestion) | `Cmd/Ctrl + .` |
 
 The editor is Monaco, so most VS Code shortcuts also work — multi-cursor
 (`Cmd/Ctrl + click`), comment toggle (`Cmd/Ctrl + /`), move line

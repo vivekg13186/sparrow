@@ -38,6 +38,89 @@ highlight, `Enter` runs it, `Esc` closes.
 The palette rebuilds its list each time you open it, so brand-new
 snippets and actions appear immediately — no app restart needed.
 
+## Git browser
+
+Open a git repository in a dedicated tab via **Tools → Git Browser…** (or
+the **GitBranch** icon in the toolbar, or the Command Palette → "Open Git
+browser…"). The browser shells out to the system `git` binary so your
+existing `.gitconfig`, credential helpers, and SSH keys all keep working.
+
+What the browser covers (about 90% of daily git use):
+
+- **Status overview** — current branch label, ahead/behind chips against
+  the upstream, and two lists: Staged Changes and Changes.
+- **Stage / unstage** — `+` on each unstaged row stages that file; `-` on
+  each staged row unstages it. "Stage all" / "Unstage all" links at the
+  top of each section operate on every file in the list.
+- **Diff** — clicking a file path opens a unified-diff modal with adds
+  (green), deletes (red), hunk headers, and context lines visually
+  distinct.
+- **Commit** — write a message in the textarea and hit **Commit**. The
+  button is disabled until something's staged and the message is
+  non-empty. `Cmd/Ctrl + Enter` while focused in the textarea commits
+  too.
+- **Pull / Push** — `git pull` and `git push` against the configured
+  upstream. Success flashes a quick toast; errors (auth failures, merge
+  conflicts) show inline.
+- **Open in editor** — every row has an **Open** button that pipes the
+  file path back through the usual `Open` flow, so you can fix issues
+  in the editor without leaving the project.
+
+What's deliberately out of scope: branch creation/switch, log graph,
+merge-conflict resolution, stashes. For any of that, open a terminal in
+the same folder (`Cmd/Ctrl + T`) and run git directly.
+
+Refresh: the status auto-refreshes whenever the tab becomes active. A
+manual refresh button lives in the top-right of the tab.
+
+## Spell check and the Problems panel
+
+Sparrow runs CSpell against markdown and plaintext tabs as you type. Issues
+show three ways:
+
+- **Inline squiggles** in the editor (Monaco's info-severity underlines).
+- **Lightbulb / Quick Fix**: place the cursor on a flagged word and press
+  `Cmd/Ctrl + .` (or click the lightbulb). The menu lists the top five
+  suggestions — picking one replaces the word in place.
+- **Problems panel**: a collapsible drawer above the status bar. Click the
+  amber triangle badge in the status bar (or run **Show Problems panel**
+  from the Command Palette). Each row shows the location, the misspelled
+  word, and chip-style suggestion buttons. Click a row to jump there;
+  click a chip to replace and recheck.
+
+The panel is per-tab — switching tabs re-points the list at the new
+buffer's issues. Toggle spell check entirely off with the **SpellCheck**
+icon in the main toolbar.
+
+## Markdown preview
+
+The split markdown preview has a small toolbar with two utilities:
+
+- **Copy as HTML** (clipboard icon) — copies the rendered HTML to the
+  clipboard so you can paste it straight into an email, Notion, Confluence,
+  or any rich-text target. Both `text/html` and a plain-text fallback are
+  written, so terminal and editor pastes still see something sensible.
+- **Export as PDF** (printer icon) — opens a print preview of just the
+  rendered HTML (no editor chrome, light theme), then you pick **Save as
+  PDF** in the system print dialog. The output is fully selectable text
+  (not rasterized), so search and copy still work in the resulting PDF.
+
+Both commands also live in the Command Palette under the **Preview** group
+when a markdown tab is active.
+
+## Hidden files (.env, .gitignore, …)
+
+The native OS file picker hides dotfiles by default and there's no
+cross-platform way for an app to force it open. Two ways to work around
+that in Sparrow:
+
+- **File Explorer tab**: lists every entry, including dotfiles. The
+  "Show hidden" checkbox is on by default; toggle it off if you want to
+  hide them temporarily — the preference is remembered.
+- **Open file by path…**: Command Palette → "Open file by path…". Paste
+  the absolute path (e.g. `/Users/you/project/.env`) and it opens straight
+  away.
+
 ## Snippets
 
 Snippets come in two flavors:

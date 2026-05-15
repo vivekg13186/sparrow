@@ -35,7 +35,21 @@ const currentPath = ref(props.initialPath);
 const entries = ref([]);
 const loading = ref(false);
 const errorMsg = ref("");
-const showHidden = ref(false);
+// Persisted preference. Default is "show" because the previous default
+// (hide) made dotfiles like `.env`, `.gitignore`, and `.github/` invisible
+// — and those are exactly the files developers usually want to find.
+const showHidden = ref(
+  typeof localStorage !== "undefined"
+    ? localStorage.getItem("sparrow.explorerShowHidden") !== "0"
+    : true
+);
+watch(showHidden, (v) => {
+  try {
+    localStorage.setItem("sparrow.explorerShowHidden", v ? "1" : "0");
+  } catch (_) {
+    /* ignore quota / private mode */
+  }
+});
 
 async function loadDir(path) {
   loading.value = true;
