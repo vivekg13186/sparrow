@@ -1,5 +1,3 @@
-# Sparrow
- 
 ![Sparrow](src-tauri/icons/128x128.png)
 
 A lightweight notepad built on Tauri + Vue + Monaco.
