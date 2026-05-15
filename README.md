@@ -55,6 +55,7 @@ A lightweight notepad built on Tauri + Vue + Monaco.
 - Built-in terminals (PTY-backed via xterm.js)
 - HTTP client for `.http` files (REST Client–compatible)
 - Git browser — status, stage, commit, pull, push (shells out to your system `git`)
+- Search in folder — ripgrep-grade content search (`Cmd/Ctrl + Shift + F`), honors `.gitignore`
 - Command Palette — VS Code-style fuzzy launcher (`Cmd/Ctrl + Shift + P`)
 - Snippets — text snippets and **prompt snippets** that run through AI
 - Quick Actions — saved shell commands or Python scripts with template variables (`{file}`, `{dir}`, `{selection}`, …)

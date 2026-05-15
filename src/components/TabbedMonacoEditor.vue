@@ -20,6 +20,13 @@ import FileExplorerTab from "./FileExplorerTab.vue";
 import TableTab from "./TableTab.vue";
 import WhiteboardTab from "./WhiteboardTab.vue";
 import GitTab from "./GitTab.vue";
+import SearchTab from "./SearchTab.vue";
+
+// Branding asset. Imported through Vite so it gets fingerprinted and
+// inlined / fetched correctly in both dev and prod. The source PNG is a
+// copy of the 256×256 app icon (128x128@2x) — high enough resolution to
+// stay crisp when downscaled to the ~22 px toolbar size.
+import sparrowLogo from "../assets/toolbar.png";
 import PreviewTab from "./PreviewTab.vue";
 import { registerHttpLanguage } from "../http-language.js";
 import { findRequestAtCursor } from "../http-parser.js";
@@ -466,6 +473,25 @@ function makeGitTab(repoPath) {
   };
 }
 
+// Code search tab. `rootPath` is the folder to recursively search; the
+// optional `initialQuery` pre-fills the input so palette / context-menu
+// launches can pass a starter pattern.
+function makeSearchTab(rootPath, initialQuery = "") {
+  const id = nextTabId++;
+  const leaf =
+    rootPath
+      .split(/[\\/]/)
+      .filter(Boolean)
+      .pop() || rootPath || "Search";
+  return {
+    id,
+    kind: "search",
+    filename: `Search: ${leaf}`,
+    rootPath,
+    initialQuery,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Active-tab plumbing
 // ---------------------------------------------------------------------------
@@ -526,6 +552,9 @@ const previewTabsList = computed(() =>
 );
 const gitTabsList = computed(() =>
   tabs.value.filter((t) => t.kind === "git")
+);
+const searchTabsList = computed(() =>
+  tabs.value.filter((t) => t.kind === "search")
 );
 
 function activateTab(tabId) {
@@ -1097,6 +1126,72 @@ async function handleGitBrowser() {
     flashStatus(`Opened git: ${tab.filename}`);
   } catch (err) {
     flashStatus(`Could not open git tab: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Code Search
+// ---------------------------------------------------------------------------
+//
+// Opens a new "Search" tab. If an explorer tab is currently active, we
+// default the root to that explorer's folder — saves a click for the
+// common case of "I just navigated to a project, now search inside it".
+// Otherwise prompt for a folder.
+
+async function handleSearch() {
+  let rootPath = "";
+  const cur = activeTab.value;
+  if (cur && cur.kind === "explorer" && cur.folderPath) {
+    rootPath = cur.folderPath;
+  } else if (cur && cur.kind === "git" && cur.repoPath) {
+    rootPath = cur.repoPath;
+  } else if (cur && cur.kind === "search" && cur.rootPath) {
+    rootPath = cur.rootPath;
+  } else {
+    try {
+      const chosen = await openDialog({
+        title: "Search in folder",
+        directory: true,
+        multiple: false,
+      });
+      if (!chosen) return;
+      rootPath = Array.isArray(chosen) ? chosen[0] : chosen;
+    } catch (err) {
+      flashStatus(`Could not pick folder: ${err}`);
+      return;
+    }
+  }
+  const tab = makeSearchTab(rootPath);
+  tabs.value = [...tabs.value, tab];
+  activateTab(tab.id);
+  flashStatus(`Search in ${rootPath}`);
+}
+
+// Called when a search result row is clicked. The payload contains the
+// absolute path plus the matched line and column so we can jump straight
+// there in the freshly-opened editor tab.
+async function openSearchResult(payload) {
+  if (!payload || !payload.path) return;
+  try {
+    await openPathSmart(payload.path);
+  } catch (err) {
+    flashStatus(`Open failed: ${err}`);
+    return;
+  }
+  // After openPathSmart, the just-opened (or re-activated) editor tab
+  // is the active one. Move the cursor to the matched line/column and
+  // reveal it.
+  await nextTick();
+  const tab = activeTab.value;
+  if (!tab || tab.kind !== "editor" || !editor) return;
+  const line = Math.max(1, payload.line || 1);
+  const column = Math.max(1, payload.column || 1);
+  try {
+    editor.revealLineInCenter(line);
+    editor.setPosition({ lineNumber: line, column });
+    editor.focus();
+  } catch (err) {
+    console.warn("[search] could not reveal line:", err);
   }
 }
 
@@ -2922,6 +3017,8 @@ onMounted(async () => {
           return handleFileExplorer();
         case "git_browser":
           return handleGitBrowser();
+        case "search_in_folder":
+          return handleSearch();
         case "ai_assist":
           return handleAiAssist();
         case "ai_settings":
@@ -3110,6 +3207,7 @@ function iconFor(tab) {
   if (tab.kind === "terminal") return Terminal;
   if (tab.kind === "explorer") return Folder;
   if (tab.kind === "git") return GitBranch;
+  if (tab.kind === "search") return Search;
   if (tab.kind === "table") return FileSpreadsheet;
   if (tab.kind === "whiteboard") return PenTool;
   if (tab.kind === "preview") {
@@ -3539,6 +3637,12 @@ function buildPaletteCommands() {
   });
   cmds.push({
     group: "Tools",
+    label: "Search in folder…",
+    hint: "Ctrl/Cmd+Shift+F",
+    run: handleSearch,
+  });
+  cmds.push({
+    group: "Tools",
     label: "AI Assist on selection",
     hint: "Ctrl/Cmd+Shift+A",
     run: handleAiAssist,
@@ -3687,6 +3791,20 @@ function handleCommandPaletteKey(event) {
     return;
   }
 
+  // Search in folder: Cmd/Ctrl + Shift + F. VS Code's "Find in Files"
+  // accelerator. Same key-code fallback as the palette opener.
+  if (
+    mod &&
+    event.shiftKey &&
+    (event.code === "KeyF" || event.key === "F" || event.key === "f") &&
+    !isModalChromeOpen()
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    handleSearch();
+    return;
+  }
+
   // While open: arrow keys, Enter, Escape.
   if (!cmdPaletteOpen.value) return;
   const list = filteredPaletteCommands.value;
@@ -3716,6 +3834,21 @@ function handleCommandPaletteKey(event) {
     <!-- Toolbar: same actions as the native menu, plus a Terminal shortcut.
          Each button is now icon-only with a tooltip via `title`. -->
     <div class="toolbar">
+      <!--
+        App branding. The logo sits at the very left of the toolbar so
+        the wordmark is the first thing the eye lands on. It's a static
+        decorative element — not a button — so we use a plain <img>
+        rather than a <button> and pin the alt for screen-reader users.
+      -->
+      <div class="tb-brand" title="Sparrow">
+        <img
+          :src="sparrowLogo"
+          alt="Sparrow"
+          class="tb-brand-img"
+          draggable="false"
+        />
+   
+      </div>
       <button class="tb-btn" @click="handleNew" title="New (Ctrl/Cmd+N)">
         <FilePlus :size="14" />
       </button>
@@ -3731,20 +3864,6 @@ function handleCommandPaletteKey(event) {
         title="Save As (Ctrl/Cmd+Shift+S)"
       ><FileDown :size="14" /></button>
       <button
-        class="tb-btn"
-        @click="cycleTab(-1)"
-        :disabled="tabs.length < 2"
-        title="Previous tab (Ctrl+Shift+Tab)"
-        aria-label="Previous tab"
-      ><ChevronLeft :size="14" /></button>
-      <button
-        class="tb-btn"
-        @click="cycleTab(1)"
-        :disabled="tabs.length < 2"
-        title="Next tab (Ctrl+Tab)"
-        aria-label="Next tab"
-      ><ChevronRight :size="14" /></button>
-      <button
         class="tb-btn tb-term"
         @click="handleTerminal"
         title="Open Terminal (Ctrl/Cmd+T)"
@@ -3759,6 +3878,11 @@ function handleCommandPaletteKey(event) {
         @click="handleGitBrowser"
         title="Open Git browser (status / stage / commit / pull / push)"
       ><GitBranch :size="14" /></button>
+      <button
+        class="tb-btn tb-search"
+        @click="handleSearch"
+        title="Search in folder (Cmd/Ctrl+Shift+F)"
+      ><Search :size="14" /></button>
       <button
         class="tb-btn tb-whiteboard"
         @click="handleNewWhiteboard"
@@ -3832,6 +3956,26 @@ function handleCommandPaletteKey(event) {
       keeps "create a new tab" one click away even when the dropdown is shut.
     -->
     <div class="tab-header">
+      <!--
+        Prev / next tab chevrons. Sit immediately left of the active-tab
+        dropdown trigger so the navigation cluster reads left-to-right:
+        prev → current tab → next. Disabled when there's no second tab
+        to move to.
+      -->
+      <button
+        class="tab-nav-btn"
+        @click="cycleTab(-1)"
+        :disabled="tabs.length < 2"
+        title="Previous tab (Ctrl+Shift+Tab)"
+        aria-label="Previous tab"
+      ><ChevronLeft :size="14" /></button>
+      <button
+        class="tab-nav-btn"
+        @click="cycleTab(1)"
+        :disabled="tabs.length < 2"
+        title="Next tab (Ctrl+Tab)"
+        aria-label="Next tab"
+      ><ChevronRight :size="14" /></button>
       <button
         ref="tabTriggerEl"
         class="tab-trigger"
@@ -4049,6 +4193,28 @@ function handleCommandPaletteKey(event) {
           :repo-path="tab.repoPath"
           :active="tab.id === activeTabId"
           @open-file="openFileFromExplorer"
+          @title-change="(title) => { tab.filename = title; refreshTabsList(); }"
+        />
+      </div>
+
+      <!--
+        Code-search tabs. Each is bound to a folder root; the SearchTab
+        component invokes the Rust `code_search` command (ripgrep-grade
+        engine via the `grep` crates). We keep all of them mounted with
+        v-show so an in-progress search and the result list survive
+        switching to another tab and back.
+      -->
+      <div
+        v-for="tab in searchTabsList"
+        :key="tab.id"
+        v-show="tab.id === activeTabId"
+        class="search-wrap"
+      >
+        <SearchTab
+          :initial-root="tab.rootPath"
+          :initial-query="tab.initialQuery || ''"
+          :active="tab.id === activeTabId"
+          @open-file="openSearchResult"
           @title-change="(title) => { tab.filename = title; refreshTabsList(); }"
         />
       </div>
@@ -5007,6 +5173,42 @@ function handleCommandPaletteKey(event) {
   border-bottom: 1px solid #0f0f0f;
 }
 
+/* Branding block at the toolbar's left edge. The icon is rendered at
+   22 px logical size (using the 256 px source so it stays sharp on
+   retina). A thin divider on the right separates the wordmark from the
+   action buttons that follow. Decorative — no interaction. */
+.tb-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 4px;
+  margin-right: 4px;
+  border-right: 1px solid #2a2a2a;
+  user-select: none;
+  /* The image and label both get a soft shadow so the logo doesn't
+     look like a floating sticker on the dark toolbar. */
+  cursor: default;
+}
+
+.tb-brand-img {
+  width: 22px;
+  height: 22px;
+  display: block;
+  /* Anti-alias gets harsh on hard-edged icons when downscaled by the
+     browser; image-rendering: auto + a tiny shadow keeps it readable. */
+  image-rendering: auto;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+
+.tb-brand-name {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #d4d4d4;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+}
+
 .tb-btn {
   background: #2d2d2d;
   color: #d4d4d4;
@@ -5174,6 +5376,7 @@ function handleCommandPaletteKey(event) {
 }
 
 .tab-add,
+.tab-nav-btn,
 .theme-toggle {
   background: transparent;
   border: none;
@@ -5189,9 +5392,22 @@ function handleCommandPaletteKey(event) {
 }
 
 .tab-add:hover,
+.tab-nav-btn:hover:not(:disabled),
 .theme-toggle:hover {
   background: #333;
   color: #fff;
+}
+
+/* Smaller horizontal padding for the chevron pair — they're inline with
+   the tab trigger so we don't want them eating too much real estate. */
+.tab-nav-btn {
+  padding: 0 8px;
+  border-right: 1px solid #1e1e1e;
+}
+
+.tab-nav-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .theme-toggle {
@@ -5673,6 +5889,12 @@ function handleCommandPaletteKey(event) {
 }
 
 .git-wrap {
+  position: absolute;
+  inset: 0;
+  background: #1e1e1e;
+}
+
+.search-wrap {
   position: absolute;
   inset: 0;
   background: #1e1e1e;

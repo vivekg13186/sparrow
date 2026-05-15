@@ -68,6 +68,7 @@ The editor is Monaco, so most VS Code shortcuts also work — multi-cursor
 | --- | --- |
 | New Terminal | `Cmd/Ctrl + T` |
 | File Explorer | `Cmd/Ctrl + Shift + E` |
+| Search in folder (ripgrep-grade) | `Cmd/Ctrl + Shift + F` |
 | AI Assist (on selection) | `Cmd/Ctrl + Shift + A` |
 | Submit prompt inside the AI dialog | `Cmd/Ctrl + Enter` |
 

@@ -590,6 +590,306 @@ fn path_parent(path: String) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Code search (ripgrep semantics via the `grep` crates)
+// ---------------------------------------------------------------------------
+//
+// Sparrow's search tab. We link the same crates ripgrep is built from
+// (`grep-regex`, `grep-searcher`, `ignore`) rather than shelling out, so:
+//
+//   - the user doesn't need `rg` installed
+//   - we get identical search semantics across platforms
+//   - we can stream results back as structured data instead of parsing
+//     `rg --json` line-by-line
+//
+// Walks the tree honoring `.gitignore` / `.ignore` / hidden-by-default
+// rules (the `ignore` crate does all the heavy lifting). For each matching
+// file we collect up to `MAX_PER_FILE` lines + total match count, and we
+// cap the overall response at `MAX_RESULTS` files so a careless `.` query
+// doesn't kill the WebView. Both numbers are tuned generously enough that
+// real-world searches feel exhaustive but bad queries stay survivable.
+
+const MAX_RESULTS: usize = 500;
+const MAX_PER_FILE: usize = 50;
+const MAX_LINE_BYTES: usize = 600;
+
+#[derive(serde::Deserialize)]
+struct SearchInput {
+    /// Repository / folder root to search from.
+    root: String,
+    /// Search pattern. Interpreted as a regex when `regex` is true; otherwise
+    /// escaped to a literal (so `foo.bar` searches for that literal text
+    /// rather than "foo" + any char + "bar").
+    query: String,
+    /// True to honor the pattern as-is; false to escape it as a literal.
+    #[serde(default)]
+    regex: bool,
+    /// True for case-sensitive; false (default) uses "smart case": case
+    /// insensitive unless the query contains uppercase characters.
+    #[serde(default)]
+    case_sensitive: bool,
+    /// True to wrap the pattern in `\b…\b` so partial-word hits are
+    /// rejected. Combines with `regex` and `case_sensitive` cleanly.
+    #[serde(default)]
+    whole_word: bool,
+    /// Optional glob include filter (e.g. "*.rs", "src/**/*.ts"). Empty
+    /// = no filter. Multiple patterns are not supported here; the
+    /// frontend can splice them with `{a,b}` if it wants to.
+    #[serde(default)]
+    include_glob: String,
+    /// True to also search hidden files / dirs (dotfiles). Default off,
+    /// matching ripgrep's behavior.
+    #[serde(default)]
+    include_hidden: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SearchMatchLine {
+    line_number: u64,
+    /// 1-based byte column of the first match on this line.
+    column: usize,
+    /// Length of the first match in bytes — frontend uses it to highlight.
+    match_len: usize,
+    /// Trimmed line text (truncated if very long).
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct SearchFileResult {
+    /// Path relative to the search root, with forward slashes for display.
+    relative_path: String,
+    /// Absolute path — handy when the frontend opens it.
+    absolute_path: String,
+    /// Lines that matched (capped at MAX_PER_FILE).
+    matches: Vec<SearchMatchLine>,
+    /// Total matches in the file (may exceed `matches.len()` if capped).
+    total_matches: u64,
+}
+
+#[derive(serde::Serialize)]
+struct SearchResponse {
+    files: Vec<SearchFileResult>,
+    /// True if we hit MAX_RESULTS and stopped early. The frontend uses
+    /// this to show a "narrow your query" hint.
+    truncated: bool,
+    /// Total files scanned (whether they matched or not). Useful for a
+    /// "searched N files in 0.4s" status footer.
+    files_scanned: u64,
+}
+
+#[tauri::command]
+fn code_search(input: SearchInput) -> Result<SearchResponse, String> {
+    use grep_matcher::Matcher;
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::{Searcher, Sink, SinkMatch};
+    use ignore::WalkBuilder;
+
+    if input.query.trim().is_empty() {
+        return Ok(SearchResponse {
+            files: Vec::new(),
+            truncated: false,
+            files_scanned: 0,
+        });
+    }
+
+    // Build the regex matcher. Smart-case mirrors ripgrep: case-insensitive
+    // unless the query has any uppercase char. The escape-for-literal path
+    // routes through `regex::escape` so even `+`, `(`, `[` etc. are matched
+    // verbatim when `regex` is false.
+    let has_upper = input.query.chars().any(|c| c.is_uppercase());
+    let case_insensitive = if input.case_sensitive {
+        false
+    } else {
+        !has_upper
+    };
+    // Compose the regex source. Literal queries get every metachar
+    // escaped first; regex queries pass through as-is. Whole-word mode
+    // wraps the result in `\b…\b` so partial-token hits are dropped.
+    let core = if input.regex {
+        input.query.clone()
+    } else {
+        regex_lite_escape(&input.query)
+    };
+    let pattern = if input.whole_word {
+        format!(r"\b(?:{})\b", core)
+    } else {
+        core
+    };
+
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(case_insensitive)
+        .multi_line(false)
+        .build(&pattern)
+        .map_err(|e| format!("Invalid pattern: {e}"))?;
+
+    // Compile the include glob, if any. We use the `ignore` crate's
+    // override matcher (it's exactly the same matcher rg uses for `-g`).
+    let mut override_builder = ignore::overrides::OverrideBuilder::new(&input.root);
+    if !input.include_glob.trim().is_empty() {
+        override_builder
+            .add(input.include_glob.trim())
+            .map_err(|e| format!("Invalid include glob: {e}"))?;
+    }
+    let overrides = override_builder
+        .build()
+        .map_err(|e| format!("Glob build failed: {e}"))?;
+
+    let mut walker = WalkBuilder::new(&input.root);
+    walker
+        .hidden(!input.include_hidden)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .overrides(overrides);
+
+    let mut files: Vec<SearchFileResult> = Vec::new();
+    let mut files_scanned: u64 = 0;
+    let mut truncated = false;
+
+    let root_path = std::path::PathBuf::from(&input.root);
+
+    for result in walker.build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        files_scanned += 1;
+
+        // Per-file sink: collect lines while we walk this file. We bail
+        // early once we've collected MAX_PER_FILE so huge log files don't
+        // dominate the response. Generic over the matcher type so we can
+        // call `find` to get the per-line column without re-borrowing.
+        struct PerFileSink<'m, M: Matcher> {
+            lines: Vec<SearchMatchLine>,
+            total: u64,
+            matcher: &'m M,
+        }
+        impl<'m, M: Matcher> Sink for PerFileSink<'m, M> {
+            type Error = std::io::Error;
+            fn matched(
+                &mut self,
+                _searcher: &Searcher,
+                m: &SinkMatch<'_>,
+            ) -> Result<bool, Self::Error> {
+                self.total += 1;
+                if self.lines.len() >= MAX_PER_FILE {
+                    // Keep walking so we can report the true total, but
+                    // don't store any more line bodies.
+                    return Ok(true);
+                }
+                let bytes = m.bytes();
+                // Column + match length: re-run the matcher against the
+                // line's bytes to get the byte range of the first hit.
+                // grep-searcher doesn't surface this directly, but for
+                // a fully-compiled regex this is cheap.
+                let (column, match_len) = match self.matcher.find(bytes) {
+                    Ok(Some(rng)) => (rng.start() + 1, rng.end() - rng.start()),
+                    _ => (1usize, 0usize),
+                };
+                let raw = String::from_utf8_lossy(bytes);
+                let trimmed = raw.trim_end_matches(|c| c == '\n' || c == '\r');
+                // Truncate at MAX_LINE_BYTES, but BACK UP to a char
+                // boundary first — UTF-8 multi-byte sequences span 2-4
+                // bytes, and `from_utf8_lossy` peppers binary-ish input
+                // with 3-byte U+FFFD replacements, so a naive byte slice
+                // can land mid-character and panic. Walking backwards
+                // is cheap (at most 3 steps because the longest UTF-8
+                // sequence is 4 bytes).
+                let text = if trimmed.len() > MAX_LINE_BYTES {
+                    let mut cut = MAX_LINE_BYTES;
+                    while cut > 0 && !trimmed.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    format!("{}…", &trimmed[..cut])
+                } else {
+                    trimmed.to_string()
+                };
+                self.lines.push(SearchMatchLine {
+                    line_number: m.line_number().unwrap_or(0),
+                    column,
+                    match_len,
+                    text,
+                });
+                Ok(true)
+            }
+        }
+
+        let mut sink = PerFileSink {
+            lines: Vec::new(),
+            total: 0,
+            matcher: &matcher,
+        };
+        let mut searcher = grep_searcher::SearcherBuilder::new()
+            .line_number(true)
+            // Skip files containing NUL bytes — ripgrep's default
+            // heuristic for "this is binary, leave it alone". Without
+            // this we'd happily search a `.png` or `.zip` and emit
+            // garbage rows. `quit` aborts the search at the first NUL
+            // rather than just hiding the offending lines, which is
+            // both faster and avoids leaking any pre-NUL noise.
+            .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+            .build();
+        if searcher
+            .search_path(&matcher, entry.path(), &mut sink)
+            .is_err()
+        {
+            // Binary file, permission denied, etc. — skip silently.
+            continue;
+        }
+        if sink.total == 0 {
+            continue;
+        }
+
+        let abs = entry.path().to_string_lossy().into_owned();
+        let rel = entry
+            .path()
+            .strip_prefix(&root_path)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| abs.clone());
+
+        files.push(SearchFileResult {
+            relative_path: rel,
+            absolute_path: abs,
+            matches: sink.lines,
+            total_matches: sink.total,
+        });
+
+        if files.len() >= MAX_RESULTS {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok(SearchResponse {
+        files,
+        truncated,
+        files_scanned,
+    })
+}
+
+/// Tiny regex escape — we link `grep-regex` but not the full `regex` crate,
+/// so we provide our own escape for non-regex literal queries. Covers every
+/// metachar the regex crate recognizes.
+fn regex_lite_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^'
+            | '$' | '#' | '-' | '&' | ':' | '!' | '<' | '>' | '"' | '\'' | '~' | '/' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Git operations
 // ---------------------------------------------------------------------------
 //
@@ -866,6 +1166,7 @@ pub fn run() {
             git_pull,
             git_push,
             git_diff,
+            code_search,
         ])
         .setup(|app| {
             // --- File menu ---
@@ -984,6 +1285,10 @@ pub fn run() {
             let git_browser_item =
                 MenuItemBuilder::with_id("git_browser", "Git Browser…")
                     .build(app)?;
+            let search_in_folder_item =
+                MenuItemBuilder::with_id("search_in_folder", "Search in Folder…")
+                    .accelerator("CmdOrCtrl+Shift+F")
+                    .build(app)?;
             let ai_assist_item = MenuItemBuilder::with_id("ai_assist", "AI Assist")
                 .accelerator("CmdOrCtrl+Shift+A")
                 .build(app)?;
@@ -1001,6 +1306,7 @@ pub fn run() {
                 .item(&terminal_item)
                 .item(&file_explorer_item)
                 .item(&git_browser_item)
+                .item(&search_in_folder_item)
                 .separator()
                 .item(&ai_assist_item)
                 .item(&ai_settings_item)

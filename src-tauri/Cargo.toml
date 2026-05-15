@@ -29,3 +29,13 @@ serde_json = "1"
 portable-pty = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "http2", "charset", "json"] }
 
+# The crates ripgrep itself is built from. `grep-regex` is the regex matcher,
+# `grep-searcher` walks files and yields matched lines, `ignore` honors
+# `.gitignore` / `.ignore` / hidden-file rules, and `grep-matcher` is the
+# shared matcher trait. Together they give us full ripgrep search semantics
+# without a `rg` binary in PATH.
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+ignore = "0.4"
+

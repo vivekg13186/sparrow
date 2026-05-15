@@ -38,6 +38,40 @@ highlight, `Enter` runs it, `Esc` closes.
 The palette rebuilds its list each time you open it, so brand-new
 snippets and actions appear immediately — no app restart needed.
 
+## Search in folder
+
+Cross-file search powered by the same crates ripgrep is built from
+(`grep-regex`, `grep-searcher`, `ignore`). Open via **Tools → Search in
+Folder…**, the magnifier icon in the toolbar, `Cmd/Ctrl + Shift + F`, or
+the Command Palette → "Search in folder…".
+
+If you're sitting on a File Explorer or Git Browser tab when you invoke
+search, the new tab inherits that folder as the search root. Otherwise
+you pick one.
+
+The tab has:
+
+- A query input — type and matches appear after a 250 ms debounce.
+- Toggles on the right: **Aa** (case sensitive), **\\b** (whole word),
+  **.*** (treat the pattern as a regex; otherwise it's a literal).
+- An **include** glob field below the query (e.g. `*.rs`,
+  `src/**/*.ts`).
+- A **.hidden** checkbox to include dotfiles / dotdirs.
+- A results list grouped by file with line numbers, highlighted match
+  spans, and a per-file expand/collapse chevron. Each line is a click
+  target that opens the file in an editor tab and jumps the cursor to
+  the matched line and column.
+
+What's honored automatically: `.gitignore`, `.ignore`, parent-dir
+`.gitignore`, global git ignore (`core.excludesFile`), and binary file
+skipping. So a search inside a project doesn't drown in
+`node_modules/` / `target/`. To override, flip the **.hidden** toggle
+or write an include glob.
+
+Limits: max 500 files in the response, max 50 matches per file. If a
+search hits those caps the status line shows "truncated, narrow your
+query".
+
 ## Git browser
 
 Open a git repository in a dedicated tab via **Tools → Git Browser…** (or
